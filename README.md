@@ -12,7 +12,7 @@ PC Booster keeps an eye on CPU, memory, storage, and GPU activity, and gives you
 
 ## Download
 
-Download the latest standalone **[PC Booster.exe](https://github.com/Mayer-ELbot/PC-Booster/releases/latest/download/PC%20Booster.exe)** from GitHub Releases. No Python installation is required.
+Download the latest standalone **[PC Booster for Windows](https://github.com/Mayer-ELbot/PC-Booster/releases/latest/download/PC.Booster.exe)** from GitHub Releases. No Python installation is required.
 
 Windows may show a SmartScreen prompt because the executable is not code-signed. The source and build workflow are public so you can inspect how it is made.
 
