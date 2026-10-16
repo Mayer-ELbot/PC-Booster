@@ -1,69 +1,115 @@
 <div align="center">
-  <img src="assets/pc_booster_icon.png" width="92" alt="PC Booster logo">
-  <h1>PC Booster</h1>
-  <p>A calm, local-first Windows toolkit for system monitoring and reversible cleanup.</p>
+  <img src="assets/pc_booster_icon.png" width="96" alt="PC Booster Pro logo">
+  <h1>⚡ PC Booster Pro 2026</h1>
+  <p><strong>Autonomous Zero-Kill Windows Optimization Suite & Real-Time Sentinel</strong></p>
   <p>
-    <a href="https://github.com/Mayer-ELbot/PC-Booster/releases/latest"><img alt="Download for Windows" src="https://img.shields.io/badge/Download-Windows-50d8b4?style=for-the-badge&logo=windows&logoColor=0b1215"></a>
-    <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-8aa69f?style=for-the-badge"></a>
+    <a href="https://github.com/Mayer-ELbot/PC-Booster/releases/latest"><img alt="Download for Windows" src="https://img.shields.io/badge/Download_for_Windows-v1.0.0_Official-00f5a0?style=for-the-badge&logo=windows&logoColor=080d10"></a>
+    <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-00d9f5?style=for-the-badge"></a>
+    <img alt="Python 3.14" src="https://img.shields.io/badge/Python-3.14_Native-859f97?style=for-the-badge&logo=python&logoColor=white">
+    <img alt="Zero-Kill Safe" src="https://img.shields.io/badge/Safety-Zero--Kill_Non--Destructive-ffb800?style=for-the-badge">
   </p>
 </div>
 
-PC Booster keeps an eye on CPU, memory, storage, and GPU activity, and gives you a small set of deliberate Windows maintenance tools. It runs locally, asks before making changes, and avoids force-closing apps or disabling core Windows services.
+---
 
-## Download
+## ⚡ What is PC Booster Pro? / ما هو البرنامج؟
 
-Download the latest standalone **[PC Booster for Windows](https://github.com/Mayer-ELbot/PC-Booster/releases/latest/download/PC.Booster.exe)** from GitHub Releases. No Python installation is required.
+**PC Booster Pro** is an autonomous, high-performance Windows optimization suite designed for gamers, creators, and power users who want peak responsiveness **without destructive force-killing or mystery registry bloat**.
 
-Windows may show a SmartScreen prompt because the executable is not code-signed. The source and build workflow are public so you can inspect how it is made.
-
-## What it does
-
-- **Live overview:** CPU, memory, system-drive usage and activity, and GPU activity. NVIDIA systems can also show GPU memory and temperature when the local `nvidia-smi` utility is available.
-- **Memory Manager:** review visible desktop apps running under your account, sorted by memory use. Ask selected apps to close normally so each app can show its own save prompt. PC Booster never force-terminates an app or purges memory behind your back.
-- **Memory pressure guidance:** after three low-memory readings, get a reminder to review high-usage apps. No apps are closed automatically.
-- **Storage Cleanup:** review files in your account's temporary folder by age, then move selected files to the Recycle Bin.
-- **Startup Apps:** disable or restore entries in your current-user startup list.
-- **Reversible Windows Tweaks:** reduce minimize/maximize animation and turn off transparency for your Windows account. Original values are saved locally so you can restore them.
-- **Background mode:** keep monitoring from the system tray, reduce sampling frequency while hidden, and optionally start minimized when you sign in to Windows.
-
-## Background and startup
-
-Open **Windows Tweaks** and choose **Start PC Booster when I sign in to Windows** to add or remove its entry in your account's `Run` registry key. This is off until you enable it. With startup enabled, the app starts minimized to the tray. Close or minimize the window to keep it in the tray; choose **Exit PC Booster** from the tray menu to quit completely.
-
-## Safety and privacy
-
-- Changes apply to the current Windows account and are reversible where the app offers a restore action.
-- Cleanup is restricted to the current user's temporary folder; selected files go to the Recycle Bin.
-- The app does not disable Windows Update, Defender, system services, or the page file.
-- Monitoring and settings stay on this PC. PC Booster does not send telemetry or make network requests.
-- App memory figures are working-set estimates; closing an app may not release that entire amount. Save your work before asking an app to close.
-- Settings and restore backups are stored under `%LOCALAPPDATA%\PC Booster`.
-
-## Build from source
-
-Requirements: Windows, Python 3.14, and the packages in `requirements.txt`.
-
-```powershell
-py -3.14 -m pip install -r requirements.txt
-py -3.14 app.py
-```
-
-Build a standalone, windowed executable:
-
-```powershell
-.\build.ps1
-```
-
-The executable is written to `dist/PC Booster.exe`. Downloadable builds are published in [GitHub Releases](https://github.com/Mayer-ELbot/PC-Booster/releases).
-
-## Contributing
-
-Issues and pull requests are welcome. Keep changes focused, explain Windows settings that are changed, and preserve clear restore paths for system tweaks.
-
-## License
-
-PC Booster is released under the [MIT License](LICENSE).
+Unlike aggressive task-killers, PC Booster Pro adheres strictly to the **Zero-Kill Safety Manifesto**:
+- **Never terminates active user applications or games**.
+- Proactively compacts idle working-set memory (`EmptyWorkingSet`), suppresses background CPU spikes (EcoQoS), and boosts active foreground game priority.
+- 100% Native, zero telemetry, local-first, and fully reversible.
 
 ---
 
-Made for Windows users who want useful controls without mystery optimizations.
+## 🚀 Key Features / أهم المميزات
+
+### 🤖 1. Autonomous Auto-Pilot Sentinel (المحرك الذكي الصامت)
+- **Foreground Turbo Priority Shield**: Automatically detects the active game or software (`GetForegroundWindow`) and elevates its thread scheduling priority (`Above Normal / High`) for maximum FPS and low input latency.
+- **Background Bloatware & Memory Leak Tamer**: Silently flushes unused physical memory pages from idle background processes back to Windows without closing them.
+- **Voice & Stream Shield**: Dedicated immunity protection for `Discord`, `Spotify`, `OBS`, `Steam`, ensuring zero voice stutter or audio lag.
+- **Emergency Auto-Recovery**: If system memory usage exceeds 88%, the sentinel automatically triggers a non-destructive recovery sweep.
+
+### ⚡ 2. 1-Click Quick Boost (تسريع وتنظيف فوري بضغطة زر)
+- Instantly flushes idle working sets across background processes, flushes the Windows DNS resolver cache (`DnsFlushResolverCache`), and restores instant OS responsiveness.
+- Smooth number counter HUD displaying the exact megabytes of RAM freed in real-time.
+
+### 🧹 3. Multi-Target Deep Storage Cleaner (المنظف الشامل)
+- Scans and cleans 6 distinct targets:
+  1. User Temporary Files (`%TEMP%`)
+  2. Windows System Temp (`C:\Windows\Temp`)
+  3. Google Chrome Web Cache
+  4. Microsoft Edge Web Cache
+  5. Windows Crash Dumps (`%LOCALAPPDATA%\CrashDumps`)
+  6. Windows Recycle Bin (with 1-click safe empty)
+
+### 🛠️ 4. Reversible Windows & Gaming Tweaks (تعديلات ويندوز الآمنة)
+- **Windows Game Mode**: Optimizes Windows CPU scheduling for games.
+- **Instant Menu Response (10ms)**: Drops right-click and Start Menu delay from 400ms to 10ms.
+- **Disable Background UWP Apps**: Stops Windows Store apps from running in the background.
+- **Disable Bing Web Suggestions**: Accelerates Start Menu local searches.
+- **Reduce Window Animations & Acrylic Blur**: GPU power savers.
+- *Every tweak is backed up locally before change and restorable with 1 click.*
+
+### 💻 5. Hardware Diagnostics & System Deck (مواصفات العتاد)
+- Comprehensive live inventory of Processor model, physical cores, logical threads, clock speed, RAM usage split, GPU accelerators, multi-drive partition capacities, Windows build, and system uptime.
+
+### 🎨 6. 2026 Cyber-Obsidian UI with Fluid Animations (واجهة نيون وعدادات دائرية)
+- High-performance Canvas vector circular donut gauges for CPU, Memory, Disk, and GPU with smooth 50 FPS lerp interpolation.
+- Pulsing neon sentinel radar beacon.
+- Animated non-blocking floating Cyber Toasts.
+- Complete Bilingual Support with one-click toggle (`🌐 عربي / English`).
+
+### 🖥️ 7. Enhanced System Tray Experience (شريط المهام)
+- Runs quietly in the tray with quick-access controls: Quick Boost Now, Open Dashboard, Settings, and Clean Exit.
+
+---
+
+## 📥 Download Standalone Executable / التحميل المباشر
+
+Download the latest pre-compiled single-file executable:
+
+👉 **[Download PC Booster Pro for Windows](https://github.com/Mayer-ELbot/PC-Booster/releases/latest/download/PC.Booster.exe)**
+
+- **Single Portable File**: 100% self-contained, no Python or external runtimes required.
+- **Platform**: Windows 10 / Windows 11 (64-bit).
+
+---
+
+## 🛠️ Build from Source / البناء من المصدر
+
+### Requirements:
+- Windows 10/11
+- Python 3.14 (or 3.12+)
+- Packages in `requirements.txt` (`psutil`, `pystray`, `Pillow`, `pyinstaller`)
+
+```powershell
+# 1. Install dependencies
+py -3.14 -m pip install -r requirements.txt
+
+# 2. Run from source
+py -3.14 app.py
+
+# 3. Build standalone single-file EXE
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+The compiled binary will be placed at `dist/PC Booster.exe`.
+
+---
+
+## 🧪 Automated Testing / التحقق والاختبار
+
+Run the complete test suite:
+
+```powershell
+py -3.14 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+---
+
+## 📄 License
+
+PC Booster Pro is released under the [MIT License](LICENSE).
+Built with craftsmanship for Windows users who demand peak performance without compromise.

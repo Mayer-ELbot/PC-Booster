@@ -63,7 +63,7 @@ def _short(value: str, limit: int = 120) -> str:
 
 
 class CircularGauge(tk.Canvas):
-    """High-performance vector circular gauge widget drawn on tk.Canvas."""
+    """High-performance vector circular gauge widget with smooth fluid animation."""
 
     def __init__(
         self,
@@ -84,16 +84,31 @@ class CircularGauge(tk.Canvas):
         self.size = size
         self.thickness = thickness
         self.title_text = title
-        self.percent = 0.0
+        self.current_percent = 0.0
+        self.target_percent = 0.0
         self.detail_text = ""
+        self._animating = False
         self._center = size // 2
         self._radius = (size - thickness - 8) // 2
         self._draw()
 
     def set_value(self, percent: float, detail: str = "") -> None:
-        self.percent = max(0.0, min(100.0, float(percent)))
+        self.target_percent = max(0.0, min(100.0, float(percent)))
         self.detail_text = detail
-        self._draw()
+        if not self._animating:
+            self._animate_step()
+
+    def _animate_step(self) -> None:
+        diff = self.target_percent - self.current_percent
+        if abs(diff) < 0.35:
+            self.current_percent = self.target_percent
+            self._animating = False
+            self._draw()
+        else:
+            self._animating = True
+            self.current_percent += diff * 0.22  # Smooth ease-out lerp
+            self._draw()
+            self.after(20, self._animate_step)  # ~50 FPS fluid frame update
 
     def _draw(self) -> None:
         self.delete("all")
@@ -118,15 +133,15 @@ class CircularGauge(tk.Canvas):
         )
 
         # Dynamic arc color based on load
-        if self.percent < 68:
+        if self.current_percent < 68:
             color = ACCENT
-        elif self.percent < 86:
+        elif self.current_percent < 86:
             color = WARN
         else:
             color = DANGER
 
         # Foreground active arc
-        active_extent = -(sweep * (self.percent / 100.0))
+        active_extent = -(sweep * (self.current_percent / 100.0))
         if abs(active_extent) > 0.5:
             self.create_arc(
                 bbox,
@@ -141,7 +156,7 @@ class CircularGauge(tk.Canvas):
         self.create_text(
             c,
             c - 6,
-            text=f"{self.percent:.0f}%",
+            text=f"{self.current_percent:.0f}%",
             fill=TEXT,
             font=(FONT, 16, "bold"),
         )
@@ -215,10 +230,13 @@ class PCBooster(tk.Tk):
         self.tweak_status_vars: dict[str, tk.StringVar] = {}
         self.tweak_status_labels: dict[str, tk.Label] = {}
         self.gauges: dict[str, CircularGauge] = {}
+        self._pulse_idx: int = 0
+        self._toast_frame: tk.Frame | None = None
 
         self._build_shell()
         self.show_page("home")
 
+        self.after(350, self._pulse_sentinel)
         self.after(120, self._poll_pending)
         self.after(800, self._tick)
 
@@ -280,6 +298,76 @@ class PCBooster(tk.Tk):
             width=9,
         )
         self.style.map("Dark.Vertical.TScrollbar", background=[("active", ACCENT_DARK)])
+
+    def _pulse_sentinel(self) -> None:
+        if self.closing:
+            return
+        pulse_colors = ["#00f5a0", "#10b981", "#34d399", "#6ee7b7", "#00d9f5", "#00f5a0"]
+        color = pulse_colors[self._pulse_idx % len(pulse_colors)]
+        self._pulse_idx += 1
+        if hasattr(self, "sentinel_dot") and self.sentinel_dot.winfo_exists():
+            self.sentinel_dot.configure(fg=color)
+        self.after(350, self._pulse_sentinel)
+
+    def show_cyber_toast(self, message: str, icon: str = "🚀", is_success: bool = True) -> None:
+        """Slides down a sleek floating cyber toast at the top-center of the window."""
+        if hasattr(self, "_toast_frame") and self._toast_frame:
+            try:
+                self._toast_frame.destroy()
+            except Exception:
+                pass
+
+        toast_bg = "#0f231c" if is_success else "#2d1616"
+        toast_border = ACCENT if is_success else DANGER
+        toast = tk.Frame(
+            self,
+            bg=toast_bg,
+            highlightthickness=1,
+            highlightbackground=toast_border,
+            padx=18,
+            pady=10,
+        )
+        self._toast_frame = toast
+
+        tk.Label(
+            toast,
+            text=f"{icon}  {message}",
+            bg=toast_bg,
+            fg=TEXT,
+            font=(FONT, 10, "bold"),
+        ).pack(side="left")
+
+        target_y = 54
+        current_y = -45
+        toast.place(relx=0.5, y=current_y, anchor="n")
+
+        def slide_down(step: int = 0) -> None:
+            nonlocal current_y
+            if self.closing or not toast.winfo_exists():
+                return
+            if step < 9:
+                current_y += (target_y - current_y) * 0.38 + 2
+                toast.place(relx=0.5, y=current_y, anchor="n")
+                self.after(16, lambda: slide_down(step + 1))
+            else:
+                toast.place(relx=0.5, y=target_y, anchor="n")
+                self.after(3400, slide_up)
+
+        def slide_up(step: int = 0) -> None:
+            nonlocal current_y
+            if self.closing or not toast.winfo_exists():
+                return
+            if step < 9:
+                current_y -= 8
+                toast.place(relx=0.5, y=current_y, anchor="n")
+                self.after(16, lambda: slide_up(step + 1))
+            else:
+                try:
+                    toast.destroy()
+                except Exception:
+                    pass
+
+        slide_down()
 
     def _build_shell(self) -> None:
         shell = tk.Frame(self, bg=BG)
@@ -511,6 +599,12 @@ class PCBooster(tk.Tk):
             cursor="hand2",
             takefocus=True,
         )
+
+        hover_bg = ACCENT if primary else (BORDER if not color else "#24e6ff")
+        hover_fg = BG if (primary or color) else ACCENT
+        button.bind("<Enter>", lambda e, b=button, hbg=hover_bg, hfg=hover_fg: b.configure(bg=hbg, fg=hfg))
+        button.bind("<Leave>", lambda e, b=button, nbg=bg_color, nfg=fg_color: b.configure(bg=nbg, fg=nfg))
+
         return button
 
     def _section_heading(self, parent: tk.Misc, title: str, description: str = "") -> tk.Frame:
@@ -753,7 +847,7 @@ class PCBooster(tk.Tk):
             apps = result["apps_trimmed"]
             msg = f"✨ Quick Boost Complete: Freed {freed_mb:.1f} MB RAM across {apps} apps in {result['elapsed_seconds']:.2f}s!"
             self.set_status(msg)
-            messagebox.showinfo("PC Booster Pro", msg, parent=self)
+            self.show_cyber_toast(msg, icon="🚀", is_success=True)
             self._update_event_hud()
 
     # =========================================================================
