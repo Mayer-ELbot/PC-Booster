@@ -8,6 +8,33 @@ from typing import Any
 
 APP_NAME = "PC Booster"
 
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "language": "en",
+    "auto_pilot_enabled": True,
+    "foreground_turbo": True,
+    "background_ram_taming": True,
+    "background_cpu_eco": True,
+    "ram_tame_threshold_mb": 350,
+    "ram_emergency_threshold_percent": 88,
+    "close_to_tray": True,
+    "start_at_login": False,
+    "tray_notifications": True,
+    "auto_memory_alert": True,
+    "whitelist": [
+        "steam.exe",
+        "steamwebhelper.exe",
+        "discord.exe",
+        "spotify.exe",
+        "obs64.exe",
+        "code.exe",
+        "devenv.exe",
+        "photoshop.exe",
+        "blender.exe",
+        "epicgameslauncher.exe",
+        "riotclientservices.exe",
+    ],
+}
+
 
 def data_dir() -> Path:
     root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
@@ -33,3 +60,21 @@ def write_json(name: str, value: Any) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def get_settings() -> dict[str, Any]:
+    loaded = read_json("settings.json", {})
+    if not isinstance(loaded, dict):
+        loaded = {}
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update(loaded)
+    # Ensure whitelist is a list of strings
+    if not isinstance(settings.get("whitelist"), list):
+        settings["whitelist"] = list(DEFAULT_SETTINGS["whitelist"])
+    else:
+        settings["whitelist"] = [str(item).lower().strip() for item in settings["whitelist"] if item]
+    return settings
+
+
+def save_settings(settings: dict[str, Any]) -> None:
+    write_json("settings.json", settings)

@@ -7,8 +7,41 @@ from .state import read_json, write_json
 
 
 TWEAKS: dict[str, dict[str, Any]] = {
+    "gamemode": {
+        "label": "Enable Windows Game Mode",
+        "description": "Optimizes the Windows process scheduler for games and prioritizes gaming threads.",
+        "path": r"Software\Microsoft\GameBar",
+        "value_name": "AllowAutoGameMode",
+        "target": 1,
+        "target_type": winreg.REG_DWORD,
+    },
+    "menushowdelay": {
+        "label": "Instant Menu & Context Response (10ms)",
+        "description": "Reduces desktop menu display delay from 400ms to 10ms for instantaneous right-click.",
+        "path": r"Control Panel\Desktop",
+        "value_name": "MenuShowDelay",
+        "target": "10",
+        "target_type": winreg.REG_SZ,
+    },
+    "backgroundapps": {
+        "label": "Disable Background UWP Apps",
+        "description": "Prevents idle Windows Store/UWP apps from quietly consuming CPU in the background.",
+        "path": r"Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
+        "value_name": "GlobalUserDisabled",
+        "target": 1,
+        "target_type": winreg.REG_DWORD,
+    },
+    "bingsearch": {
+        "label": "Disable Bing Suggestions in Start Search",
+        "description": "Stops slow web suggestions in Start Menu, making local app searching instantaneous.",
+        "path": r"Software\Microsoft\Windows\CurrentVersion\Search",
+        "value_name": "BingSearchEnabled",
+        "target": 0,
+        "target_type": winreg.REG_DWORD,
+    },
     "animations": {
         "label": "Reduce minimize and maximize animations",
+        "description": "Reduces window minimize/maximize animation time for snappy desktop navigation.",
         "path": r"Control Panel\Desktop\WindowMetrics",
         "value_name": "MinAnimate",
         "target": "0",
@@ -16,6 +49,7 @@ TWEAKS: dict[str, dict[str, Any]] = {
     },
     "transparency": {
         "label": "Turn off Windows transparency effects",
+        "description": "Disables GPU-heavy acrylic transparency across the taskbar and system windows.",
         "path": r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
         "value_name": "EnableTransparency",
         "target": 0,
@@ -69,7 +103,7 @@ def current_states() -> dict[str, bool]:
     result = {}
     for key, item in TWEAKS.items():
         value = _read_value(item["path"], item["value_name"])
-        result[key] = value.get("exists") is True and value.get("value") == item["target"]
+        result[key] = value.get("exists") is True and str(value.get("value")) == str(item["target"])
     return result
 
 
@@ -85,7 +119,6 @@ def apply_selected(names: list[str]) -> list[str]:
         backup_key = name
         if backup_key not in backups:
             backups[backup_key] = _read_value(item["path"], item["value_name"])
-            # Keep the user's original value on disk before touching the Registry.
             write_json("tweak_backup.json", backups)
         _write_value(item["path"], item["value_name"], item["target_type"], item["target"])
         applied.append(name)

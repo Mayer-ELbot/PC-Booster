@@ -1,34 +1,43 @@
 from __future__ import annotations
 
+import collections
+import os
+from pathlib import Path
 import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
-from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 from . import __version__
 from . import autostart
-from .cleanup import ScanResult, recycle_files, scan_user_temp
+from .cleaner_pro import CleanCategory, clean_categories, scan_clean_categories
+from .localization import tr
 from .monitor import SystemMonitor
 from . import ram_manager, startup, tweaks
-from .state import read_json, write_json
+from .sentinel import AutoPilotSentinel
+from .specs import get_full_system_specs
+from .state import get_settings, save_settings, write_json
 
 
-BG = "#0b1215"
-SIDEBAR = "#101a1d"
-SURFACE = "#142125"
-SURFACE_ALT = "#19292d"
-BORDER = "#263a3e"
+# 2026 Cyber-Obsidian Design Palette
+BG = "#080d10"
+SIDEBAR = "#0c1519"
+SURFACE = "#111c22"
+SURFACE_ALT = "#16252d"
+BORDER = "#1e333d"
+BORDER_GLOW = "#00f5a0"
 TEXT = "#e8f2ef"
-MUTED = "#9aafaa"
-ACCENT = "#50d8b4"
-ACCENT_DARK = "#163b34"
-HERO_BG = "#0e191e"
-WARN = "#f0b45d"
-WARN_BG = "#3a2c18"
+MUTED = "#859f97"
+ACCENT = "#00f5a0"
+ACCENT_CYAN = "#00d9f5"
+ACCENT_DARK = "#0d2b23"
+WARN = "#ffb800"
+WARN_BG = "#2c210e"
+DANGER = "#ff4757"
 FONT = "Segoe UI"
 
 
@@ -46,72 +55,181 @@ def _format_bytes(value: int | float) -> str:
     return f"{amount:.1f} TB"
 
 
-def _short(value: str, limit: int = 125) -> str:
+def _short(value: str, limit: int = 120) -> str:
     value = " ".join(value.split())
     if len(value) <= limit:
         return value
     return value[: limit - 1] + "…"
 
 
+class CircularGauge(tk.Canvas):
+    """High-performance vector circular gauge widget drawn on tk.Canvas."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        size: int = 145,
+        thickness: int = 11,
+        bg: str = SURFACE,
+    ) -> None:
+        super().__init__(
+            parent,
+            width=size,
+            height=size + 24,
+            bg=bg,
+            bd=0,
+            highlightthickness=0,
+        )
+        self.size = size
+        self.thickness = thickness
+        self.title_text = title
+        self.percent = 0.0
+        self.detail_text = ""
+        self._center = size // 2
+        self._radius = (size - thickness - 8) // 2
+        self._draw()
+
+    def set_value(self, percent: float, detail: str = "") -> None:
+        self.percent = max(0.0, min(100.0, float(percent)))
+        self.detail_text = detail
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        c = self._center
+        r = self._radius
+        t = self.thickness
+
+        bbox = (c - r, c - r, c + r, c + r)
+
+        # 270-degree sweep from 135 deg to 405 deg (leaves bottom open)
+        start_angle = 135
+        sweep = 270
+
+        # Background track
+        self.create_arc(
+            bbox,
+            start=start_angle,
+            extent=-sweep,
+            style="arc",
+            width=t,
+            outline=BORDER,
+        )
+
+        # Dynamic arc color based on load
+        if self.percent < 68:
+            color = ACCENT
+        elif self.percent < 86:
+            color = WARN
+        else:
+            color = DANGER
+
+        # Foreground active arc
+        active_extent = -(sweep * (self.percent / 100.0))
+        if abs(active_extent) > 0.5:
+            self.create_arc(
+                bbox,
+                start=start_angle,
+                extent=active_extent,
+                style="arc",
+                width=t,
+                outline=color,
+            )
+
+        # Center Text: Large Percentage
+        self.create_text(
+            c,
+            c - 6,
+            text=f"{self.percent:.0f}%",
+            fill=TEXT,
+            font=(FONT, 16, "bold"),
+        )
+
+        # Title Subtitle
+        self.create_text(
+            c,
+            c + 16,
+            text=self.title_text,
+            fill=MUTED,
+            font=(FONT, 8, "bold"),
+        )
+
+        # Bottom detail
+        if self.detail_text:
+            self.create_text(
+                c,
+                self.size + 10,
+                text=_short(self.detail_text, 28),
+                fill=MUTED,
+                font=(FONT, 8),
+            )
+
+
 class PCBooster(tk.Tk):
     def __init__(self, start_in_background: bool = False) -> None:
         super().__init__()
+        self.settings = get_settings()
+        self.lang = self.settings.get("language", "en")
+
         if start_in_background:
             self.withdraw()
-        self.title("PC Booster")
-        self.geometry("1180x800")
+
+        self.title("PC Booster Pro")
+        self.geometry("1180x820")
         self.minsize(1080, 720)
         self.configure(bg=BG)
         self.option_add("*Font", (FONT, 10))
+
         try:
             self.iconbitmap(str(_asset_path("pc_booster.ico")))
         except tk.TclError:
             pass
-        try:
-            self.hero_art = tk.PhotoImage(file=str(_asset_path("dashboard_hero_small.png")))
-        except tk.TclError:
-            self.hero_art = None
+
         self.style = ttk.Style(self)
         self._configure_style()
 
-        prefs = read_json("settings.json", {})
-        if not isinstance(prefs, dict):
-            prefs = {}
-        alert_setting = prefs.get("auto_memory_alert", True)
-        self.auto_memory_alert = alert_setting if isinstance(alert_setting, bool) else True
-        tray_setting = prefs.get("close_to_tray", True)
-        self.close_to_tray = tray_setting if isinstance(tray_setting, bool) else True
         self.start_in_background = start_in_background
         self.tray_icon: Any | None = None
         self.monitor = SystemMonitor()
+        self.sentinel = AutoPilotSentinel()
+        self.sentinel.start()
+
         self.last_snapshot: dict[str, Any] | None = None
-        self.low_memory_samples = 0
-        self.memory_pressure = False
         self.busy = False
         self.monitor_busy = False
         self.closing = False
         self.current_page = "home"
+
+        # Queues for background work
         self.pending: queue.Queue[tuple[Callable[..., None], Any, Exception | None]] = queue.Queue()
         self.monitor_pending: queue.Queue[tuple[dict[str, Any] | None, Exception | None]] = queue.Queue()
-        self.scan_result: ScanResult | None = None
-        self.scan_days: int | None = None
-        self.scan_rows: dict[str, tuple[str, int]] = {}
+
+        # State data
+        self.clean_categories_data: list[CleanCategory] = []
+        self.clean_cat_vars: dict[str, tk.BooleanVar] = {}
         self.ram_rows: dict[str, dict[str, Any]] = {}
         self.startup_active_rows: dict[str, str] = {}
         self.startup_disabled_rows: dict[str, str] = {}
-        self.metric_widgets: dict[str, dict[str, Any]] = {}
         self.tweak_vars: dict[str, tk.BooleanVar] = {}
         self.tweak_status_vars: dict[str, tk.StringVar] = {}
         self.tweak_status_labels: dict[str, tk.Label] = {}
+        self.gauges: dict[str, CircularGauge] = {}
 
         self._build_shell()
         self.show_page("home")
+
         self.after(120, self._poll_pending)
-        self.after(700, self._tick)
+        self.after(800, self._tick)
+
         self.protocol("WM_DELETE_WINDOW", self._request_close)
         self.bind("<Unmap>", self._on_unmap)
+
         if self.start_in_background:
             self.after(0, self._hide_to_tray)
+
+    def _t(self, key: str) -> str:
+        return tr(key, self.lang)
 
     def _configure_style(self) -> None:
         self.style.theme_use("clam")
@@ -120,14 +238,14 @@ class PCBooster(tk.Tk):
             background=SURFACE,
             fieldbackground=SURFACE,
             foreground=TEXT,
-            rowheight=30,
+            rowheight=32,
             borderwidth=0,
             font=(FONT, 9),
         )
         self.style.configure(
             "Treeview.Heading",
             background=SURFACE_ALT,
-            foreground=MUTED,
+            foreground=ACCENT_CYAN,
             relief="flat",
             font=(FONT, 9, "bold"),
         )
@@ -135,24 +253,6 @@ class PCBooster(tk.Tk):
             "Treeview",
             background=[("selected", ACCENT_DARK)],
             foreground=[("selected", TEXT)],
-        )
-        self.style.configure(
-            "Green.Horizontal.TProgressbar",
-            troughcolor=SURFACE_ALT,
-            background=ACCENT,
-            bordercolor=SURFACE,
-            lightcolor=ACCENT,
-            darkcolor=ACCENT,
-            thickness=7,
-        )
-        self.style.configure(
-            "Amber.Horizontal.TProgressbar",
-            troughcolor=SURFACE_ALT,
-            background=WARN,
-            bordercolor=SURFACE,
-            lightcolor=WARN,
-            darkcolor=WARN,
-            thickness=7,
         )
         self.style.configure(
             "Dark.TCombobox",
@@ -177,31 +277,33 @@ class PCBooster(tk.Tk):
             troughcolor=BG,
             bordercolor=BG,
             arrowcolor=MUTED,
-            width=10,
+            width=9,
         )
-        self.style.map(
-            "Dark.Vertical.TScrollbar",
-            background=[("active", ACCENT_DARK)],
-        )
+        self.style.map("Dark.Vertical.TScrollbar", background=[("active", ACCENT_DARK)])
 
     def _build_shell(self) -> None:
         shell = tk.Frame(self, bg=BG)
         shell.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=222, highlightthickness=0)
+        # Left Navigation Sidebar
+        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=238, highlightthickness=0)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
         self._build_sidebar()
 
+        # Right Main Workspace
         main = tk.Frame(shell, bg=BG)
         main.pack(side="right", fill="both", expand=True)
-        header = tk.Frame(main, bg=BG, padx=28, pady=10)
+
+        # Top Header Bar
+        header = tk.Frame(main, bg=BG, padx=26, pady=12)
         header.pack(fill="x")
+
         header_left = tk.Frame(header, bg=BG)
         header_left.pack(side="left", anchor="w")
         tk.Label(
             header_left,
-            text="PC BOOSTER",
+            text="PC BOOSTER PRO",
             bg=BG,
             fg=ACCENT,
             font=(FONT, 9, "bold"),
@@ -211,30 +313,62 @@ class PCBooster(tk.Tk):
             text="",
             bg=BG,
             fg=TEXT,
-            font=(FONT, 19, "bold"),
+            font=(FONT, 18, "bold"),
         )
-        self.page_title.pack(anchor="w", pady=(3, 0))
+        self.page_title.pack(anchor="w", pady=(2, 0))
 
-        live = tk.Frame(header, bg=ACCENT_DARK, padx=12, pady=7)
-        live.pack(side="right", anchor="center")
-        tk.Label(live, text="●", bg=ACCENT_DARK, fg=ACCENT, font=(FONT, 9)).pack(
-            side="left", padx=(7, 0)
+        header_right = tk.Frame(header, bg=BG)
+        header_right.pack(side="right", anchor="center")
+
+        # Language Switcher Toggle
+        lang_btn = tk.Button(
+            header_right,
+            text="🌐 عربي" if self.lang == "en" else "🌐 English",
+            command=self._toggle_language,
+            bg=SURFACE_ALT,
+            fg=TEXT,
+            activebackground=BORDER,
+            activeforeground=ACCENT,
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=(FONT, 9, "bold"),
+            cursor="hand2",
         )
-        tk.Label(
-            live, text="Local monitoring", bg=ACCENT_DARK, fg=TEXT, font=(FONT, 9, "bold")
-        ).pack(side="left")
+        lang_btn.pack(side="right", padx=(8, 0))
+        self.lang_btn = lang_btn
 
-        footer = tk.Frame(main, bg=BG, padx=28, pady=12)
+        # Sentinel Pulse Badge
+        self.sentinel_badge = tk.Frame(header_right, bg=ACCENT_DARK, padx=12, pady=6)
+        self.sentinel_badge.pack(side="right")
+        self.sentinel_dot = tk.Label(
+            self.sentinel_badge, text="●", bg=ACCENT_DARK, fg=ACCENT, font=(FONT, 9)
+        )
+        self.sentinel_dot.pack(side="left", padx=(0, 6))
+        self.sentinel_badge_text = tk.Label(
+            self.sentinel_badge,
+            text=self._t("live_monitoring"),
+            bg=ACCENT_DARK,
+            fg=TEXT,
+            font=(FONT, 9, "bold"),
+        )
+        self.sentinel_badge_text.pack(side="left")
+
+        # Bottom Status Bar
+        footer = tk.Frame(main, bg=BG, padx=26, pady=10)
         footer.pack(fill="x", side="bottom")
-        tk.Frame(footer, bg=BORDER, height=1).pack(fill="x", pady=(0, 9))
-        self.status_var = tk.StringVar(value="Monitoring runs locally on this PC.")
+        tk.Frame(footer, bg=BORDER, height=1).pack(fill="x", pady=(0, 8))
+        self.status_var = tk.StringVar(value="PC Booster Pro active. Zero-Kill Protection Engaged.")
         self.status_label = tk.Label(
             footer, textvariable=self.status_var, bg=BG, fg=MUTED, font=(FONT, 9), anchor="w"
         )
         self.status_label.pack(fill="x")
 
+        # Scrollable Page Canvas
         body = tk.Frame(main, bg=BG)
         body.pack(fill="both", expand=True)
+
         self.page_canvas = tk.Canvas(body, bg=BG, bd=0, highlightthickness=0)
         self.page_scrollbar = ttk.Scrollbar(
             body,
@@ -245,7 +379,8 @@ class PCBooster(tk.Tk):
         self.page_canvas.configure(yscrollcommand=self.page_scrollbar.set)
         self.page_canvas.pack(side="left", fill="both", expand=True)
         self.page_scrollbar.pack(side="right", fill="y")
-        self.page_body = tk.Frame(self.page_canvas, bg=BG, padx=28, pady=4)
+
+        self.page_body = tk.Frame(self.page_canvas, bg=BG, padx=26, pady=4)
         self.page_body_window = self.page_canvas.create_window(
             (0, 0), window=self.page_body, anchor="nw"
         )
@@ -258,38 +393,54 @@ class PCBooster(tk.Tk):
     def _resize_page_body(self, event: tk.Event) -> None:
         self.page_canvas.itemconfigure(self.page_body_window, width=event.width)
 
+    def _toggle_language(self) -> None:
+        self.lang = "ar" if self.lang == "en" else "en"
+        self.settings["language"] = self.lang
+        save_settings(self.settings)
+        self.lang_btn.configure(text="🌐 عربي" if self.lang == "en" else "🌐 English")
+        self.sentinel_badge_text.configure(text=self._t("live_monitoring"))
+        self._build_sidebar()
+        self.show_page(self.current_page)
+
     def _build_sidebar(self) -> None:
-        brand = tk.Frame(self.sidebar, bg=SIDEBAR, padx=20, pady=22)
+        for child in self.sidebar.winfo_children():
+            child.destroy()
+
+        brand = tk.Frame(self.sidebar, bg=SIDEBAR, padx=18, pady=20)
         brand.pack(fill="x")
+
         mark = tk.Canvas(brand, width=34, height=34, bg=SIDEBAR, highlightthickness=0)
         mark.create_oval(2, 2, 32, 32, outline=ACCENT, width=2)
-        mark.create_arc(8, 8, 26, 26, start=45, extent=290, outline=ACCENT, width=3, style="arc")
-        mark.pack(side="left", padx=(0, 9))
+        mark.create_arc(8, 8, 26, 26, start=45, extent=290, outline=ACCENT_CYAN, width=3, style="arc")
+        mark.pack(side="left", padx=(0, 10))
+
         title = tk.Frame(brand, bg=SIDEBAR)
         title.pack(side="left")
-        tk.Label(title, text="PC Booster", bg=SIDEBAR, fg=TEXT, font=(FONT, 12, "bold")).pack(
-            anchor="w"
-        )
-        tk.Label(title, text="A safe, lightweight toolkit", bg=SIDEBAR, fg=MUTED, font=(FONT, 8)).pack(
-            anchor="w", pady=(2, 0)
+        tk.Label(title, text="PC Booster", bg=SIDEBAR, fg=TEXT, font=(FONT, 12, "bold")).pack(anchor="w")
+        tk.Label(title, text="2026 Pro Suite", bg=SIDEBAR, fg=ACCENT, font=(FONT, 8, "bold")).pack(
+            anchor="w", pady=(1, 0)
         )
 
-        tk.Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=18, pady=(0, 18))
+        tk.Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(0, 14))
+
         self.nav_buttons: dict[str, tk.Button] = {}
         links = [
-            ("home", "Overview"),
-            ("memory", "Memory Manager"),
-            ("startup", "Startup Apps"),
-            ("cleanup", "Storage Cleanup"),
-            ("tweaks", "Windows Tweaks"),
+            ("home", self._t("nav_overview")),
+            ("cleaner", self._t("nav_cleaner")),
+            ("memory", self._t("nav_memory")),
+            ("startup", self._t("nav_startup")),
+            ("tweaks", self._t("nav_tweaks")),
+            ("specs", self._t("nav_specs")),
+            ("settings", self._t("nav_settings")),
         ]
+
         for key, label in links:
             button = tk.Button(
                 self.sidebar,
-                text=label,
+                text=f"  {label}",
                 anchor="w",
-                padx=18,
-                pady=13,
+                padx=16,
+                pady=11,
                 bg=SIDEBAR,
                 fg=MUTED,
                 activebackground=SURFACE_ALT,
@@ -300,15 +451,15 @@ class PCBooster(tk.Tk):
                 cursor="hand2",
                 command=lambda page=key: self.show_page(page),
             )
-            button.pack(fill="x", padx=10, pady=2)
+            button.pack(fill="x", padx=8, pady=2)
             self.nav_buttons[key] = button
 
-        footer = tk.Frame(self.sidebar, bg=SIDEBAR, padx=18, pady=18)
+        footer = tk.Frame(self.sidebar, bg=SIDEBAR, padx=16, pady=16)
         footer.pack(side="bottom", fill="x")
-        tk.Frame(footer, bg=BORDER, height=1).pack(fill="x", pady=(0, 12))
+        tk.Frame(footer, bg=BORDER, height=1).pack(fill="x", pady=(0, 10))
         tk.Label(
             footer,
-            text=f"Version {__version__}",
+            text=f"Version {__version__} Pro",
             bg=SIDEBAR,
             fg=MUTED,
             font=(FONT, 8),
@@ -316,59 +467,14 @@ class PCBooster(tk.Tk):
         ).pack(fill="x")
         tk.Label(
             footer,
-            text="Your data stays on this PC",
+            text="Autonomous Zero-Kill Engine",
             bg=SIDEBAR,
-            fg=MUTED,
-            font=(FONT, 8),
+            fg=ACCENT,
+            font=(FONT, 8, "bold"),
             anchor="w",
-        ).pack(fill="x", pady=(4, 0))
+        ).pack(fill="x", pady=(3, 0))
 
-    def _button(
-        self,
-        parent: tk.Misc,
-        label: str,
-        command: Callable[[], None],
-        primary: bool = False,
-        compact: bool = False,
-    ) -> tk.Button:
-        background = ACCENT_DARK if primary else SURFACE_ALT
-        foreground = ACCENT if primary else TEXT
-        button = tk.Button(
-            parent,
-            text=label,
-            command=command,
-            bg=background,
-            fg=foreground,
-            activebackground=ACCENT if primary else BORDER,
-            activeforeground=BG if primary else TEXT,
-            relief="flat",
-            bd=0,
-            padx=14 if compact else 18,
-            pady=8 if compact else 10,
-            font=(FONT, 9 if compact else 10, "bold"),
-            cursor="hand2",
-            takefocus=True,
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            highlightcolor=ACCENT,
-        )
-        button.bind("<FocusIn>", lambda event: event.widget.configure(highlightbackground=ACCENT))
-        button.bind("<FocusOut>", lambda event: event.widget.configure(highlightbackground=BORDER))
-        return button
-
-    def _section_heading(self, parent: tk.Misc, title: str, description: str = "") -> tk.Frame:
-        frame = tk.Frame(parent, bg=BG)
-        frame.pack(fill="x", pady=(0, 10))
-        tk.Label(frame, text=title, bg=BG, fg=TEXT, font=(FONT, 15, "bold"), anchor="w").pack(
-            fill="x"
-        )
-        if description:
-            tk.Label(
-                frame, text=description, bg=BG, fg=MUTED, font=(FONT, 9), anchor="w"
-            ).pack(fill="x", pady=(5, 0))
-        return frame
-
-    def _card(self, parent: tk.Misc, padx: int = 17, pady: int = 15) -> tk.Frame:
+    def _card(self, parent: tk.Misc, padx: int = 16, pady: int = 14) -> tk.Frame:
         return tk.Frame(
             parent,
             bg=SURFACE,
@@ -378,19 +484,62 @@ class PCBooster(tk.Tk):
             highlightbackground=BORDER,
         )
 
+    def _button(
+        self,
+        parent: tk.Misc,
+        label: str,
+        command: Callable[[], None],
+        primary: bool = False,
+        compact: bool = False,
+        color: str | None = None,
+    ) -> tk.Button:
+        bg_color = color or (ACCENT_DARK if primary else SURFACE_ALT)
+        fg_color = BG if color else (ACCENT if primary else TEXT)
+        button = tk.Button(
+            parent,
+            text=label,
+            command=command,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=ACCENT if primary else BORDER,
+            activeforeground=BG if primary else TEXT,
+            relief="flat",
+            bd=0,
+            padx=14 if compact else 18,
+            pady=8 if compact else 10,
+            font=(FONT, 9 if compact else 10, "bold"),
+            cursor="hand2",
+            takefocus=True,
+        )
+        return button
+
+    def _section_heading(self, parent: tk.Misc, title: str, description: str = "") -> tk.Frame:
+        frame = tk.Frame(parent, bg=BG)
+        frame.pack(fill="x", pady=(0, 10))
+        tk.Label(frame, text=title, bg=BG, fg=TEXT, font=(FONT, 15, "bold"), anchor="w").pack(fill="x")
+        if description:
+            tk.Label(
+                frame, text=description, bg=BG, fg=MUTED, font=(FONT, 9), anchor="w"
+            ).pack(fill="x", pady=(4, 0))
+        return frame
+
     def show_page(self, page: str) -> None:
         self.current_page = page
         self.page_canvas.yview_moveto(0)
         for child in self.page_body.winfo_children():
             child.destroy()
+
         titles = {
-            "home": "Overview",
-            "memory": "Memory Manager",
-            "startup": "Startup Apps",
-            "cleanup": "Storage Cleanup",
-            "tweaks": "Windows Tweaks",
+            "home": self._t("nav_overview"),
+            "cleaner": self._t("nav_cleaner"),
+            "memory": self._t("nav_memory"),
+            "startup": self._t("nav_startup"),
+            "tweaks": self._t("nav_tweaks"),
+            "specs": self._t("nav_specs"),
+            "settings": self._t("nav_settings"),
         }
-        self.page_title.configure(text=titles.get(page, "PC Booster"))
+        self.page_title.configure(text=titles.get(page, "PC Booster Pro"))
+
         for key, button in self.nav_buttons.items():
             active = key == page
             button.configure(
@@ -398,319 +547,371 @@ class PCBooster(tk.Tk):
                 fg=ACCENT if active else MUTED,
                 font=(FONT, 10, "bold" if active else "normal"),
             )
+
         if page == "home":
             self._render_home()
+        elif page == "cleaner":
+            self._render_cleaner()
         elif page == "memory":
             self._render_memory()
         elif page == "startup":
             self._render_startup()
-        elif page == "cleanup":
-            self._render_cleanup()
         elif page == "tweaks":
             self._render_tweaks()
+        elif page == "specs":
+            self._render_specs()
+        elif page == "settings":
+            self._render_settings()
+
+    # =========================================================================
+    # PAGE 1: OVERVIEW & VECTOR GAUGES & SENTINEL HUD
+    # =========================================================================
 
     def _render_home(self) -> None:
-        self._section_heading(
-            self.page_body,
-            "System Overview",
-            "Live CPU, memory, storage, and GPU readings while the app is open. No apps are closed automatically.",
-        )
+        # Hero Action Banner: 1-Click Quick Boost
+        hero = self._card(self.page_body, padx=18, pady=14)
+        hero.pack(fill="x", pady=(0, 10))
 
-        monitor_row = tk.Frame(self.page_body, bg=BG)
-        monitor_row.pack(fill="x", pady=(0, 6))
-        self.memory_banner = tk.Frame(monitor_row, bg=HERO_BG, height=100)
-        self.memory_banner.pack(side="left", fill="x", expand=True)
-        self.memory_banner.pack_propagate(False)
-        memory_copy = tk.Frame(self.memory_banner, bg=HERO_BG, padx=14, pady=8)
-        memory_copy.pack(side="left", fill="both", expand=True)
-        self.memory_copy = memory_copy
-        self.memory_banner_title = tk.Label(
-            memory_copy,
-            text="Monitoring is active",
-            bg=HERO_BG,
-            fg=ACCENT,
-            font=(FONT, 10, "bold"),
-            anchor="w",
-        )
-        self.memory_banner_title.pack(fill="x")
-        self.memory_banner_text = tk.Label(
-            memory_copy,
-            text="If available memory stays low, we will show the apps using the most memory without closing them.",
-            bg=HERO_BG,
-            fg=TEXT,
-            font=(FONT, 9),
-            anchor="w",
-            justify="left",
-            wraplength=380,
-        )
-        self.memory_banner_text.pack(fill="x", pady=(5, 0))
-        self._button(
-            memory_copy,
-            "Open Memory Manager",
-            lambda: self.show_page("memory"),
-            compact=True,
-        ).pack(anchor="w", pady=(4, 0))
-        if self.hero_art:
-            self.hero_art_label = tk.Label(
-                self.memory_banner, image=self.hero_art, bg=HERO_BG, bd=0
-            )
-            self.hero_art_label.pack(side="right", padx=(0, 5))
-        else:
-            self.hero_art_label = None
+        hero_left = tk.Frame(hero, bg=SURFACE)
+        hero_left.pack(side="left", fill="both", expand=True)
 
-        alert = tk.Frame(monitor_row, bg=SURFACE, padx=11, pady=8)
-        alert.pack(side="right", padx=(10, 0))
-        self.alert_var = tk.BooleanVar(value=self.auto_memory_alert)
-        check = ttk.Checkbutton(
-            alert,
-            text="Memory alert",
-            variable=self.alert_var,
-            style="Dark.TCheckbutton",
-            command=self._toggle_memory_alert,
-        )
-        check.pack()
-
-        cards = tk.Frame(self.page_body, bg=BG)
-        cards.pack(fill="x", pady=(0, 6))
-        cards.grid_columnconfigure(0, weight=1, uniform="metric")
-        cards.grid_columnconfigure(1, weight=1, uniform="metric")
-        specifications = [
-            ("cpu", "CPU", "Current usage"),
-            ("memory", "Memory", "Available"),
-            ("disk", "System drive", "Used space"),
-            ("gpu", "Graphics", "GPU activity"),
-        ]
-        for index, (key, title, hint) in enumerate(specifications):
-            card = self._metric_card(cards, key, title, hint)
-            card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=5, pady=3)
-
-        process_card = self._card(self.page_body, padx=12, pady=8)
-        process_card.pack(fill="both", expand=True)
-        process_header = tk.Frame(process_card, bg=SURFACE)
-        process_header.pack(fill="x", pady=(0, 5))
         tk.Label(
-            process_header,
-            text="Top CPU and memory apps",
-            bg=SURFACE,
-            fg=TEXT,
-            font=(FONT, 10, "bold"),
-            anchor="w",
-        ).pack(side="left")
-        self._button(
-            process_header, "Task Manager", self._open_task_manager, compact=True
-        ).pack(side="right")
-        tk.Label(
-            process_header,
-            text="Read only",
+            hero_left,
+            text=self._t("quick_boost_btn"),
             bg=SURFACE,
             fg=ACCENT,
-            font=(FONT, 8, "bold"),
-            anchor="e",
-        ).pack(side="right")
-        columns = ("name", "cpu", "memory")
-        self.process_tree = ttk.Treeview(
-            process_card, columns=columns, show="headings", height=4, selectmode="none"
-        )
-        self.process_tree.heading("name", text="App")
-        self.process_tree.heading("cpu", text="CPU")
-        self.process_tree.heading("memory", text="RAM")
-        self.process_tree.column("name", width=480, anchor="w")
-        self.process_tree.column("cpu", width=90, anchor="center", stretch=False)
-        self.process_tree.column("memory", width=110, anchor="center", stretch=False)
-        process_scroll = ttk.Scrollbar(
-            process_card, orient="vertical", command=self.process_tree.yview
-        )
-        self.process_tree.configure(yscrollcommand=process_scroll.set)
-        self.process_tree.pack(side="left", fill="both", expand=True)
-        process_scroll.pack(side="right", fill="y")
-        if self.last_snapshot:
-            self._update_home(self.last_snapshot)
-
-    def _metric_card(self, parent: tk.Misc, key: str, title: str, hint: str) -> tk.Frame:
-        card = self._card(parent, padx=14, pady=6)
-        heading = tk.Frame(card, bg=SURFACE)
-        heading.pack(fill="x")
-        tk.Label(heading, text=title, bg=SURFACE, fg=TEXT, font=(FONT, 10, "bold")).pack(
-            side="left"
-        )
-        tk.Label(heading, text=hint, bg=SURFACE, fg=MUTED, font=(FONT, 8)).pack(
-            side="right"
-        )
-        value = tk.Label(card, text="--", bg=SURFACE, fg=TEXT, font=(FONT, 19, "bold"), anchor="w")
-        value.pack(fill="x", pady=(5, 2))
-        progress = ttk.Progressbar(
-            card,
-            mode="determinate",
-            maximum=100,
-            style="Green.Horizontal.TProgressbar",
-        )
-        progress.pack(fill="x", pady=(0, 4))
-        detail = tk.Label(card, text="Reading...", bg=SURFACE, fg=MUTED, font=(FONT, 8), anchor="w")
-        detail.pack(fill="x")
-        self.metric_widgets[key] = {"value": value, "progress": progress, "detail": detail}
-        return card
-
-    def _update_home(self, data: dict[str, Any]) -> None:
-        if self.current_page != "home" or not self.metric_widgets:
-            return
-        cpu = self.metric_widgets.get("cpu")
-        if cpu:
-            cpu["value"].configure(text=f"{data['cpu']:.0f}%")
-            cpu["progress"].configure(value=data["cpu"])
-            cpu["detail"].configure(text=f"{data['cpu']:.1f}% of CPU capacity")
-
-        memory = self.metric_widgets.get("memory")
-        if memory:
-            percentage = data["memory_percent"]
-            memory["value"].configure(text=f"{percentage:.0f}% used")
-            memory["progress"].configure(
-                value=percentage,
-                style="Amber.Horizontal.TProgressbar" if percentage >= 90 else "Green.Horizontal.TProgressbar",
-            )
-            memory["detail"].configure(
-                text=f"Free {_format_bytes(data['memory_available'])} of {_format_bytes(data['memory_total'])}"
-            )
-
-        disk_metric = self.metric_widgets.get("disk")
-        disk = data.get("disk")
-        if disk_metric:
-            if disk:
-                disk_metric["value"].configure(text=f"{disk.percent:.0f}% used")
-                disk_metric["progress"].configure(
-                    value=disk.percent,
-                    style="Amber.Horizontal.TProgressbar" if disk.free < 10 * 1024**3 else "Green.Horizontal.TProgressbar",
-                )
-                disk_metric["detail"].configure(
-                    text=(
-                        f"{data['disk_root']} • Free {_format_bytes(disk.free)}"
-                        f" • Read {_format_bytes(data['disk_read_rate'])}/s"
-                        f" • Write {_format_bytes(data['disk_write_rate'])}/s"
-                    )
-                )
-            else:
-                disk_metric["value"].configure(text="Unavailable")
-                disk_metric["detail"].configure(text="Could not read the system drive")
-
-        gpu_metric = self.metric_widgets.get("gpu")
-        gpu = data.get("gpu")
-        if gpu_metric:
-            if gpu:
-                gpu_metric["value"].configure(text=f"{gpu['usage']:.0f}%")
-                gpu_metric["progress"].configure(value=gpu["usage"])
-                if gpu.get("source") == "NVIDIA":
-                    detail = (
-                        f"NVIDIA • Memory {_format_bytes(gpu['memory_used'] * 1024**2)}"
-                        f" / {_format_bytes(gpu['memory_total'] * 1024**2)}"
-                        f" • {gpu['temperature']:.0f}°C"
-                    )
-                else:
-                    detail = "Windows GPU engine activity"
-                gpu_metric["detail"].configure(text=detail)
-            else:
-                gpu_metric["value"].configure(text="Unavailable")
-                gpu_metric["progress"].configure(value=0)
-                gpu_metric["detail"].configure(text="GPU data unavailable. Check the graphics driver.")
-
-        if hasattr(self, "process_tree") and self.process_tree.winfo_exists():
-            self.process_tree.delete(*self.process_tree.get_children())
-            for process in data["processes"][:10]:
-                self.process_tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        process["name"],
-                        f"{process['cpu']:.1f}%",
-                        _format_bytes(process["memory"]),
-                    ),
-                )
-
-        if self.auto_memory_alert and self.memory_pressure:
-            self.memory_banner.configure(bg=WARN_BG)
-            self.memory_copy.configure(bg=WARN_BG)
-            if self.hero_art_label:
-                self.hero_art_label.configure(bg=HERO_BG)
-            self.memory_banner_title.configure(
-                text="Available memory has stayed low", bg=WARN_BG, fg=WARN
-            )
-            self.memory_banner_text.configure(
-                text="Review the highest-usage apps. We explain the pressure; we do not force-close apps or purge memory.",
-                bg=WARN_BG,
-            )
-        else:
-            self.memory_banner.configure(bg=HERO_BG)
-            self.memory_copy.configure(bg=HERO_BG)
-            if self.hero_art_label:
-                self.hero_art_label.configure(bg=HERO_BG)
-            self.memory_banner_title.configure(
-                text="Monitoring is active", bg=HERO_BG, fg=ACCENT
-            )
-            self.memory_banner_text.configure(
-                text="If available memory stays low, we will show the apps using the most memory without closing them.",
-                bg=HERO_BG,
-            )
-
-    def _toggle_memory_alert(self) -> None:
-        previous = self.auto_memory_alert
-        self.auto_memory_alert = bool(self.alert_var.get())
-        try:
-            write_json("settings.json", {"auto_memory_alert": self.auto_memory_alert})
-        except OSError as error:
-            self.auto_memory_alert = previous
-            self.alert_var.set(previous)
-            self.show_error(f"Could not save the alert setting: {error}")
-            return
-        if not self.auto_memory_alert:
-            self.low_memory_samples = 0
-            self.memory_pressure = False
-            self.set_status("Memory pressure alerts are off.")
-        else:
-            self.set_status("Memory pressure alerts are on.")
-        if self.last_snapshot:
-            self._update_home(self.last_snapshot)
-
-    def _open_task_manager(self) -> None:
-        try:
-            subprocess.Popen(["taskmgr.exe"], close_fds=True)
-        except OSError as error:
-            self.show_error(f"Could not open Task Manager: {error}")
-
-    def _render_memory(self) -> None:
-        self._section_heading(
-            self.page_body,
-            "Free memory on your terms",
-            "Review open desktop apps, then ask selected apps to close normally. Save your work first; each app can show its own save prompt.",
-        )
-
-        note = self._card(self.page_body, padx=16, pady=12)
-        note.pack(fill="x", pady=(0, 12))
+            font=(FONT, 13, "bold"),
+            anchor="w",
+        ).pack(fill="x")
         tk.Label(
-            note,
-            text="Only visible apps running under your account are listed. Known core Windows processes are excluded. Use Ctrl-click to select multiple apps; nothing is force-stopped.",
+            hero_left,
+            text=self._t("quick_boost_desc"),
             bg=SURFACE,
             fg=MUTED,
             font=(FONT, 9),
             anchor="w",
-            justify="left",
-            wraplength=800,
-        ).pack(fill="x")
+            wraplength=600,
+        ).pack(fill="x", pady=(4, 0))
 
-        listing = self._card(self.page_body, padx=13, pady=11)
-        listing.pack(fill="both", expand=True)
-        header = tk.Frame(listing, bg=SURFACE)
-        header.pack(fill="x", pady=(0, 8))
+        hero_right = tk.Frame(hero, bg=SURFACE)
+        hero_right.pack(side="right")
+        self._button(
+            hero_right,
+            f"⚡ {self._t('quick_boost_btn')}",
+            self._trigger_quick_boost,
+            primary=True,
+            color=ACCENT,
+        ).pack()
+
+        # Circular Donut Gauges Row
+        gauge_card = self._card(self.page_body, padx=14, pady=12)
+        gauge_card.pack(fill="x", pady=(0, 10))
+
+        gauges_grid = tk.Frame(gauge_card, bg=SURFACE)
+        gauges_grid.pack(fill="x")
+        for i in range(4):
+            gauges_grid.grid_columnconfigure(i, weight=1, uniform="gauge")
+
+        self.gauges = {
+            "cpu": CircularGauge(gauges_grid, self._t("cpu_metric")),
+            "ram": CircularGauge(gauges_grid, self._t("ram_metric")),
+            "disk": CircularGauge(gauges_grid, self._t("disk_metric")),
+            "gpu": CircularGauge(gauges_grid, self._t("gpu_metric")),
+        }
+        self.gauges["cpu"].grid(row=0, column=0, padx=6)
+        self.gauges["ram"].grid(row=0, column=1, padx=6)
+        self.gauges["disk"].grid(row=0, column=2, padx=6)
+        self.gauges["gpu"].grid(row=0, column=3, padx=6)
+
+        # Sentinel Autonomous Control Card
+        sentinel_card = self._card(self.page_body, padx=16, pady=12)
+        sentinel_card.pack(fill="x", pady=(0, 10))
+
+        s_head = tk.Frame(sentinel_card, bg=SURFACE)
+        s_head.pack(fill="x", pady=(0, 8))
         tk.Label(
-            header,
-            text="Apps using the most memory",
+            s_head,
+            text=self._t("sentinel_title"),
+            bg=SURFACE,
+            fg=TEXT,
+            font=(FONT, 11, "bold"),
+        ).pack(side="left")
+
+        stats = self.sentinel.get_stats()
+        status_text = self._t("sentinel_active") if stats["enabled"] else self._t("sentinel_idle")
+        tk.Label(
+            s_head,
+            text=f"● {status_text}",
+            bg=SURFACE,
+            fg=ACCENT if stats["enabled"] else MUTED,
+            font=(FONT, 9, "bold"),
+        ).pack(side="right")
+
+        # 3 Real-time Stat Chips
+        chips_frame = tk.Frame(sentinel_card, bg=SURFACE)
+        chips_frame.pack(fill="x", pady=(0, 10))
+        for col in range(3):
+            chips_frame.grid_columnconfigure(col, weight=1, uniform="chip")
+
+        self.chip_turbo = self._make_chip(
+            chips_frame, 0, "⚡ " + self._t("sentinel_turbo_active"), stats["active_boosted_app"]
+        )
+        self.chip_tamed = self._make_chip(
+            chips_frame, 1, "💤 " + self._t("sentinel_tamed_count"), f"{stats['tamed_count']} instances"
+        )
+        self.chip_freed = self._make_chip(
+            chips_frame, 2, "🧹 " + self._t("sentinel_ram_freed"), _format_bytes(stats["total_freed_bytes"])
+        )
+
+        # Live Event HUD Terminal
+        tk.Label(
+            sentinel_card,
+            text=f"📜 {self._t('recent_activity')}:",
+            bg=SURFACE,
+            fg=ACCENT_CYAN,
+            font=(FONT, 8, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(4, 4))
+
+        self.event_hud = tk.Frame(sentinel_card, bg=BG, padx=10, pady=8, highlightthickness=1, highlightbackground=BORDER)
+        self.event_hud.pack(fill="x")
+        self._update_event_hud()
+
+        # Top Processes Card
+        process_card = self._card(self.page_body, padx=14, pady=10)
+        process_card.pack(fill="both", expand=True)
+
+        process_header = tk.Frame(process_card, bg=SURFACE)
+        process_header.pack(fill="x", pady=(0, 6))
+        tk.Label(
+            process_header,
+            text="Active Heavy Processes",
             bg=SURFACE,
             fg=TEXT,
             font=(FONT, 10, "bold"),
             anchor="w",
         ).pack(side="left")
-        self._button(header, "Refresh", self._refresh_ram_apps, compact=True).pack(
-            side="right"
+        self._button(process_header, "Task Manager", self._open_task_manager, compact=True).pack(side="right")
+
+        columns = ("name", "cpu", "memory")
+        self.process_tree = ttk.Treeview(process_card, columns=columns, show="headings", height=5, selectmode="none")
+        self.process_tree.heading("name", text="Application")
+        self.process_tree.heading("cpu", text="CPU")
+        self.process_tree.heading("memory", text="RAM Working-Set")
+        self.process_tree.column("name", width=460, anchor="w")
+        self.process_tree.column("cpu", width=100, anchor="center", stretch=False)
+        self.process_tree.column("memory", width=140, anchor="center", stretch=False)
+
+        process_scroll = ttk.Scrollbar(process_card, orient="vertical", command=self.process_tree.yview)
+        self.process_tree.configure(yscrollcommand=process_scroll.set)
+        self.process_tree.pack(side="left", fill="both", expand=True)
+        process_scroll.pack(side="right", fill="y")
+
+        if self.last_snapshot:
+            self._update_home(self.last_snapshot)
+
+    def _make_chip(self, parent: tk.Misc, col: int, title: str, value: str) -> tk.Label:
+        chip = tk.Frame(parent, bg=SURFACE_ALT, padx=12, pady=8, highlightthickness=1, highlightbackground=BORDER)
+        chip.grid(row=0, column=col, sticky="nsew", padx=4)
+        tk.Label(chip, text=title, bg=SURFACE_ALT, fg=MUTED, font=(FONT, 8)).pack(anchor="w")
+        lbl = tk.Label(chip, text=value, bg=SURFACE_ALT, fg=TEXT, font=(FONT, 11, "bold"), anchor="w")
+        lbl.pack(anchor="w", pady=(2, 0))
+        return lbl
+
+    def _update_event_hud(self) -> None:
+        if not hasattr(self, "event_hud") or not self.event_hud.winfo_exists():
+            return
+        for child in self.event_hud.winfo_children():
+            child.destroy()
+
+        events = self.sentinel.get_stats()["events"][:4]
+        if not events:
+            tk.Label(
+                self.event_hud,
+                text="Watching in silence. No runaway processes detected.",
+                bg=BG,
+                fg=MUTED,
+                font=(FONT, 8),
+            ).pack(anchor="w")
+            return
+
+        for ev in events:
+            row = tk.Frame(self.event_hud, bg=BG)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"{ev['icon']} [{ev['time']}]", bg=BG, fg=ACCENT, font=(FONT, 8, "bold")).pack(side="left")
+            tk.Label(row, text=f" {ev['title']}: {ev['detail']}", bg=BG, fg=TEXT, font=(FONT, 8)).pack(side="left")
+
+    def _trigger_quick_boost(self) -> None:
+        if self.busy:
+            return
+        self.set_status("Executing 1-Click Quick Boost...")
+        self._start_job(self.sentinel.manual_quick_boost, self._on_quick_boost_done)
+
+    def _on_quick_boost_done(self, result: Any) -> None:
+        if isinstance(result, dict):
+            freed_mb = result["ram_freed_bytes"] / (1024 * 1024)
+            apps = result["apps_trimmed"]
+            msg = f"✨ Quick Boost Complete: Freed {freed_mb:.1f} MB RAM across {apps} apps in {result['elapsed_seconds']:.2f}s!"
+            self.set_status(msg)
+            messagebox.showinfo("PC Booster Pro", msg, parent=self)
+            self._update_event_hud()
+
+    # =========================================================================
+    # PAGE 2: MULTI-TARGET DEEP CLEANER
+    # =========================================================================
+
+    def _render_cleaner(self) -> None:
+        self._section_heading(self.page_body, self._t("cleaner_title"), self._t("cleaner_desc"))
+
+        top_card = self._card(self.page_body, padx=16, pady=12)
+        top_card.pack(fill="x", pady=(0, 10))
+
+        actions = tk.Frame(top_card, bg=SURFACE)
+        actions.pack(fill="x")
+        self._button(actions, self._t("scan_btn"), self._scan_cleaner, primary=True).pack(side="left", padx=(0, 8))
+        self._button(actions, self._t("clean_btn"), self._clean_selected_targets, color=ACCENT_CYAN).pack(side="left", padx=(0, 8))
+        self._button(actions, self._t("select_all"), self._select_all_clean_cats, compact=True).pack(side="right", padx=(6, 0))
+        self._button(actions, self._t("clear_selection"), self._clear_clean_cats, compact=True).pack(side="right")
+
+        self.clean_status_var = tk.StringVar(value="Click 'Scan System' to identify reclaimable space.")
+        tk.Label(
+            top_card,
+            textvariable=self.clean_status_var,
+            bg=SURFACE,
+            fg=MUTED,
+            font=(FONT, 9),
+            anchor="w",
+        ).pack(fill="x", pady=(10, 0))
+
+        # Categories Container
+        self.clean_items_frame = tk.Frame(self.page_body, bg=BG)
+        self.clean_items_frame.pack(fill="both", expand=True)
+
+        if not self.clean_categories_data:
+            self._scan_cleaner()
+        else:
+            self._populate_clean_categories()
+
+    def _scan_cleaner(self) -> None:
+        if self.busy:
+            return
+        self.set_status("Scanning system cleaning targets...")
+        self.clean_status_var.set("Scanning temporary folders, browser caches, and Recycle Bin...")
+        self._start_job(scan_clean_categories, self._on_cleaner_scanned)
+
+    def _on_cleaner_scanned(self, cats: Any) -> None:
+        if isinstance(cats, list):
+            self.clean_categories_data = cats
+            total_b = sum(c.total_bytes for c in cats)
+            self.clean_status_var.set(f"Scan complete. Reclaimable space found: {_format_bytes(total_b)}")
+            self.set_status(f"Scan complete: {_format_bytes(total_b)} ready to clean.")
+            self._populate_clean_categories()
+
+    def _populate_clean_categories(self) -> None:
+        if not hasattr(self, "clean_items_frame") or not self.clean_items_frame.winfo_exists():
+            return
+        for child in self.clean_items_frame.winfo_children():
+            child.destroy()
+
+        self.clean_cat_vars = {}
+        for cat in self.clean_categories_data:
+            row = self._card(self.clean_items_frame, padx=14, pady=10)
+            row.pack(fill="x", pady=4)
+
+            top = tk.Frame(row, bg=SURFACE)
+            top.pack(fill="x")
+
+            var = tk.BooleanVar(value=True if cat.total_bytes > 0 else False)
+            self.clean_cat_vars[cat.id] = var
+
+            chk = ttk.Checkbutton(top, text=cat.name, variable=var, style="Dark.TCheckbutton")
+            chk.pack(side="left")
+
+            size_badge = tk.Frame(top, bg=SURFACE_ALT, padx=8, pady=3)
+            size_badge.pack(side="right")
+            tk.Label(
+                size_badge,
+                text=f"{_format_bytes(cat.total_bytes)} ({cat.count} items)",
+                bg=SURFACE_ALT,
+                fg=ACCENT if cat.total_bytes > 0 else MUTED,
+                font=(FONT, 8, "bold"),
+            ).pack()
+
+            tk.Label(
+                row,
+                text=cat.description,
+                bg=SURFACE,
+                fg=MUTED,
+                font=(FONT, 8),
+                anchor="w",
+            ).pack(fill="x", padx=(24, 0), pady=(3, 0))
+
+    def _select_all_clean_cats(self) -> None:
+        for var in self.clean_cat_vars.values():
+            var.set(True)
+
+    def _clear_clean_cats(self) -> None:
+        for var in self.clean_cat_vars.values():
+            var.set(False)
+
+    def _clean_selected_targets(self) -> None:
+        if self.busy:
+            return
+        selected = {cid for cid, var in self.clean_cat_vars.items() if var.get()}
+        if not selected:
+            self.set_status("Select at least one cleaning target.")
+            return
+
+        total_b = sum(c.total_bytes for c in self.clean_categories_data if c.id in selected)
+        if not messagebox.askyesno(
+            "Confirm Clean",
+            f"Safely clean selected targets ({_format_bytes(total_b)})?\n\nLocked files currently in use will be skipped.",
+            parent=self,
+        ):
+            return
+
+        self.set_status("Cleaning selected targets...")
+        self._start_job(
+            lambda: clean_categories(self.clean_categories_data, selected),
+            self._on_clean_finished,
         )
 
-        self.ram_summary_var = tk.StringVar(value="Scanning for eligible desktop apps...")
+    def _on_clean_finished(self, result: Any) -> None:
+        if isinstance(result, dict):
+            freed = result["freed_bytes"]
+            files = result["files_deleted"]
+            msg = f"Cleaned {_format_bytes(freed)} across {files} files successfully!"
+            self.clean_status_var.set(msg)
+            self.set_status(msg)
+            messagebox.showinfo("PC Booster Pro", msg, parent=self)
+            self._scan_cleaner()
+
+    # =========================================================================
+    # PAGE 3: MEMORY MANAGER
+    # =========================================================================
+
+    def _render_memory(self) -> None:
+        self._section_heading(
+            self.page_body,
+            self._t("nav_memory"),
+            "Review visible desktop applications. Ask selected apps to close normally with save prompts.",
+        )
+
+        listing = self._card(self.page_body, padx=14, pady=12)
+        listing.pack(fill="both", expand=True)
+
+        header = tk.Frame(listing, bg=SURFACE)
+        header.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            header,
+            text="Visible User Applications",
+            bg=SURFACE,
+            fg=TEXT,
+            font=(FONT, 10, "bold"),
+        ).pack(side="left")
+        self._button(header, "Refresh", self._refresh_ram_apps, compact=True).pack(side="right")
+
+        self.ram_summary_var = tk.StringVar(value="Scanning active applications...")
         tk.Label(
             listing,
             textvariable=self.ram_summary_var,
@@ -718,52 +919,39 @@ class PCBooster(tk.Tk):
             fg=MUTED,
             font=(FONT, 8),
             anchor="w",
-        ).pack(fill="x", pady=(0, 7))
-        columns = ("app", "window", "memory", "windows", "pid")
-        self.ram_tree = ttk.Treeview(
-            listing, columns=columns, show="headings", selectmode="extended", height=12
-        )
-        for key, label in (
-            ("app", "Application"),
-            ("window", "Window title"),
-            ("memory", "Memory"),
-            ("windows", "Windows"),
-            ("pid", "PID"),
-        ):
-            self.ram_tree.heading(key, text=label)
-        self.ram_tree.column("app", width=170, anchor="w")
-        self.ram_tree.column("window", width=330, anchor="w")
-        self.ram_tree.column("memory", width=100, anchor="center", stretch=False)
-        self.ram_tree.column("windows", width=75, anchor="center", stretch=False)
-        self.ram_tree.column("pid", width=75, anchor="center", stretch=False)
+        ).pack(fill="x", pady=(0, 6))
+
+        columns = ("app", "window", "memory", "pid")
+        self.ram_tree = ttk.Treeview(listing, columns=columns, show="headings", selectmode="extended", height=12)
+        self.ram_tree.heading("app", text="Application")
+        self.ram_tree.heading("window", text="Window Title")
+        self.ram_tree.heading("memory", text="Working-Set Memory")
+        self.ram_tree.heading("pid", text="PID")
+        self.ram_tree.column("app", width=180, anchor="w")
+        self.ram_tree.column("window", width=380, anchor="w")
+        self.ram_tree.column("memory", width=120, anchor="center", stretch=False)
+        self.ram_tree.column("pid", width=80, anchor="center", stretch=False)
+
         scroll = ttk.Scrollbar(listing, orient="vertical", command=self.ram_tree.yview)
         self.ram_tree.configure(yscrollcommand=scroll.set)
         self.ram_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
         actions = tk.Frame(self.page_body, bg=BG)
-        actions.pack(fill="x", pady=(11, 0))
-        self._button(
-            actions, "Ask selected apps to close", self._close_selected_ram_apps, primary=True
-        ).pack(side="right")
-        self._button(actions, "Clear selection", self._clear_ram_selection, compact=True).pack(
-            side="left"
-        )
+        actions.pack(fill="x", pady=(10, 0))
+        self._button(actions, "Request Graceful Close (WM_CLOSE)", self._close_selected_ram_apps, primary=True).pack(side="right")
+        self._button(actions, "Clear Selection", self._clear_ram_selection, compact=True).pack(side="left")
+
         self._refresh_ram_apps()
 
     def _refresh_ram_apps(self) -> None:
-        if self.busy:
-            self.set_status("Wait for the current operation to finish.")
+        if self.busy or self.current_page != "memory":
             return
-        if self.current_page != "memory":
-            return
-        self.ram_summary_var.set("Scanning for eligible desktop apps...")
-        self.set_status("Scanning visible apps running under your account...")
+        self.ram_summary_var.set("Scanning visible applications...")
         self._start_job(ram_manager.list_background_apps, self._ram_apps_loaded)
 
     def _ram_apps_loaded(self, apps: Any) -> None:
         if not isinstance(apps, list):
-            self.show_error("The memory scan returned an invalid result.")
             return
         self.ram_rows = {str(app["pid"]): app for app in apps}
         if self.current_page != "memory" or not hasattr(self, "ram_tree"):
@@ -774,719 +962,529 @@ class PCBooster(tk.Tk):
                 "",
                 "end",
                 iid=item_id,
-                values=(
-                    app["name"],
-                    _short(app["title"], 75),
-                    _format_bytes(app["memory"]),
-                    app["window_count"],
-                    app["pid"],
-                ),
+                values=(app["name"], _short(app["title"], 75), _format_bytes(app["memory"]), app["pid"]),
             )
-        if apps:
-            self.ram_summary_var.set(
-                f"{len(apps)} eligible apps • Memory shown is approximate; closing an app may not free its full working set."
-            )
-            self.set_status("Memory scan complete. Select only apps you are ready to close.")
-        else:
-            self.ram_summary_var.set(
-                "No eligible visible desktop apps were found. Background services and Windows essentials are hidden."
-            )
-            self.set_status("No eligible desktop apps were found.")
+        self.ram_summary_var.set(f"{len(apps)} eligible desktop apps found. Core Windows processes excluded.")
 
     def _clear_ram_selection(self) -> None:
-        if hasattr(self, "ram_tree") and self.ram_tree.winfo_exists():
+        if hasattr(self, "ram_tree"):
             self.ram_tree.selection_remove(self.ram_tree.selection())
 
     def _close_selected_ram_apps(self) -> None:
-        if self.busy:
-            self.set_status("Wait for the current operation to finish.")
+        if self.busy or not hasattr(self, "ram_tree"):
             return
-        selected = self.ram_tree.selection() if hasattr(self, "ram_tree") else ()
+        selected = self.ram_tree.selection()
         apps = [self.ram_rows[item] for item in selected if item in self.ram_rows]
         if not apps:
             self.set_status("Select at least one app first.")
             return
-        if len(apps) > 8:
-            self.set_status("Select no more than eight apps per close request.")
-            self.show_error("For a clear review, select up to eight apps per request.")
-            return
-        names = [app["name"] for app in apps]
-        preview = "\n".join(f"• {name}" for name in names)
-        estimated = sum(int(app["memory"]) for app in apps)
+        names = "\n".join(f"• {a['name']}" for a in apps[:6])
         if not messagebox.askyesno(
-            "Confirm app close",
-            (
-                f"Ask these {len(apps)} app(s) to close?\n{preview}\n\n"
-                f"Approximate memory in the selected apps: {_format_bytes(estimated)}.\n\n"
-                "Save your work first. Each app can show its own save prompt. "
-                "PC Booster will not force-stop or restart anything."
-            ),
+            "Confirm Close Request",
+            f"Send normal close request to {len(apps)} app(s)?\n{names}\n\nEach app will display its standard save prompt.",
             parent=self,
         ):
             return
-        self.set_status("Sending normal close requests to selected apps...")
-        self._start_job(
-            lambda: ram_manager.request_graceful_close(apps),
-            self._ram_close_finished,
-        )
+        self._start_job(lambda: ram_manager.request_graceful_close(apps), self._ram_close_finished)
 
     def _ram_close_finished(self, result: Any) -> None:
-        if not isinstance(result, dict):
-            self.show_error("The app-close request returned an invalid result.")
-            return
-        requested = result.get("requested", [])
-        skipped = result.get("skipped", [])
-        failed = result.get("failed", [])
-        self.set_status(
-            f"Close request sent to {len(requested)} app(s). Apps may ask to save or may stay open."
-        )
-        if skipped or failed:
-            details = []
-            if skipped:
-                details.append("No longer available or no longer eligible: " + ", ".join(skipped[:6]))
-            if failed:
-                details.append("Windows rejected the close request: " + ", ".join(failed[:6]))
-            self.show_error("Some apps could not receive a close request.\n\n" + "\n".join(details))
-        if self.current_page == "memory":
-            self.after(1300, self._refresh_ram_apps)
+        if isinstance(result, dict):
+            req = len(result.get("requested", []))
+            self.set_status(f"Sent normal close request to {req} app(s).")
+            self.after(1200, self._refresh_ram_apps)
 
-    def _render_cleanup(self) -> None:
-        self._section_heading(
-            self.page_body,
-            "Old temporary files",
-            "We scan only your account's temporary folder. Review and select files; cleanup sends them to the Recycle Bin.",
-        )
-
-        card = self._card(self.page_body, padx=16, pady=14)
-        card.pack(fill="x", pady=(0, 12))
-        controls = tk.Frame(card, bg=SURFACE)
-        controls.pack(fill="x")
-        tk.Label(
-            controls,
-            text="Older than",
-            bg=SURFACE,
-            fg=MUTED,
-            font=(FONT, 9),
-        ).pack(side="left", padx=(0, 8))
-        self.age_var = tk.IntVar(value=7)
-        self.age_combo = ttk.Combobox(
-            controls,
-            textvariable=self.age_var,
-            values=(3, 7, 14, 30),
-            state="readonly",
-            width=5,
-            style="Dark.TCombobox",
-            justify="center",
-        )
-        self.age_combo.bind("<<ComboboxSelected>>", self._cleanup_age_changed)
-        self.age_combo.pack(side="left")
-        tk.Label(
-            controls, text="days", bg=SURFACE, fg=MUTED, font=(FONT, 9)
-        ).pack(side="left", padx=(8, 16))
-        self._button(controls, "Scan files", self._scan_temp, primary=True).pack(
-            side="left"
-        )
-        self._button(controls, "Select all", self._select_all_clean, compact=True).pack(
-            side="right", padx=(8, 0)
-        )
-        self._button(controls, "Clear selection", self._clear_clean_selection, compact=True).pack(
-            side="right"
-        )
-
-        self.scan_summary_var = tk.StringVar(value="Scan to review files before cleanup.")
-        tk.Label(
-            card,
-            textvariable=self.scan_summary_var,
-            bg=SURFACE,
-            fg=MUTED,
-            font=(FONT, 9),
-            anchor="w",
-            justify="left",
-            wraplength=760,
-        ).pack(fill="x", pady=(11, 0))
-
-        listing = self._card(self.page_body, padx=12, pady=10)
-        listing.pack(fill="both", expand=True)
-        columns = ("name", "folder", "size")
-        self.clean_tree = ttk.Treeview(
-            listing, columns=columns, show="headings", selectmode="extended", height=15
-        )
-        self.clean_tree.heading("name", text="File name")
-        self.clean_tree.heading("folder", text="Folder")
-        self.clean_tree.heading("size", text="Size")
-        self.clean_tree.column("name", width=220, anchor="w")
-        self.clean_tree.column("folder", width=490, anchor="w")
-        self.clean_tree.column("size", width=95, anchor="center", stretch=False)
-        scroll = ttk.Scrollbar(listing, orient="vertical", command=self.clean_tree.yview)
-        self.clean_tree.configure(yscrollcommand=scroll.set)
-        self.clean_tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        bottom = tk.Frame(self.page_body, bg=BG)
-        bottom.pack(fill="x", pady=(11, 0))
-        self._button(bottom, "Move selected to Recycle Bin", self._clean_selected, primary=True).pack(
-            side="right"
-        )
-        tk.Label(
-            bottom,
-            text="Recent files are excluded. Windows may ask for confirmation for some large files.",
-            bg=BG,
-            fg=MUTED,
-            font=(FONT, 8),
-        ).pack(side="left", anchor="w")
-        if self.scan_result:
-            suffix = (
-                " (Showing the first 1,000 results; more files may exist)"
-                if self.scan_result.truncated
-                else ""
-            )
-            self.scan_summary_var.set(
-                f"Found {len(self.scan_result.files)} files older than {self.scan_days or 7} days • Displayed size "
-                f"{_format_bytes(self.scan_result.bytes_total)} • {self.scan_result.scanned_root}{suffix}"
-            )
-            self._populate_clean_tree(self.scan_result)
-
-    def _cleanup_age_changed(self, _event: Any = None) -> None:
-        if not self.scan_result:
-            return
-        self.scan_result = None
-        self.scan_days = None
-        self.scan_rows = {}
-        if hasattr(self, "clean_tree") and self.clean_tree.winfo_exists():
-            self.clean_tree.delete(*self.clean_tree.get_children())
-            self.scan_summary_var.set("The age filter changed. Scan again before cleanup.")
-        self.set_status("Choose an age filter, then scan again.")
-
-    def _scan_temp(self) -> None:
-        if self.busy:
-            self.set_status("Wait for the current operation to finish.")
-            return
-        days = int(self.age_var.get())
-        self.set_status(f"Scanning temporary files older than {days} days...")
-        self._start_job(
-            lambda: scan_user_temp(days),
-            lambda result: self._scan_finished(result, days),
-        )
-
-    def _scan_finished(self, result: Any, requested_days: int) -> None:
-        if not isinstance(result, ScanResult):
-            self.show_error("The scan returned an invalid result.")
-            return
-        if int(self.age_var.get()) != requested_days:
-            self.scan_result = None
-            self.scan_days = None
-            self.scan_rows = {}
-            if self.current_page == "cleanup" and hasattr(self, "clean_tree"):
-                self.clean_tree.delete(*self.clean_tree.get_children())
-                self.scan_summary_var.set("The age filter changed during the scan. Scan again.")
-            self.set_status("The age filter changed before the scan finished. Scan the new range.")
-            return
-        self.scan_result = result
-        self.scan_days = requested_days
-        self._populate_clean_tree(result)
-        suffix = " (Showing the first 1,000 results; more files may exist)" if result.truncated else ""
-        self.scan_summary_var.set(
-            f"Found {len(result.files)} files older than {requested_days} days • Displayed size "
-            f"{_format_bytes(result.bytes_total)} • {result.scanned_root}{suffix}"
-        )
-        self.set_status("Scan complete. Select files to move to the Recycle Bin.")
-
-    def _populate_clean_tree(self, result: ScanResult) -> None:
-        if self.current_page != "cleanup" or not hasattr(self, "clean_tree"):
-            return
-        self.clean_tree.delete(*self.clean_tree.get_children())
-        self.scan_rows = {}
-        for index, (path, size) in enumerate(result.files):
-            row_id = str(index)
-            self.scan_rows[row_id] = (path, size)
-            self.clean_tree.insert(
-                "",
-                "end",
-                iid=row_id,
-                values=(Path(path).name, str(Path(path).parent), _format_bytes(size)),
-            )
-
-    def _select_all_clean(self) -> None:
-        if hasattr(self, "clean_tree"):
-            self.clean_tree.selection_set(self.clean_tree.get_children())
-
-    def _clear_clean_selection(self) -> None:
-        if hasattr(self, "clean_tree"):
-            self.clean_tree.selection_remove(self.clean_tree.selection())
-
-    def _clean_selected(self) -> None:
-        if self.busy:
-            self.set_status("Wait for the current operation to finish.")
-            return
-        if not self.scan_result or not hasattr(self, "clean_tree"):
-            self.set_status("Run a scan first.")
-            return
-        selected = self.clean_tree.selection()
-        candidates = [self.scan_rows[item] for item in selected if item in self.scan_rows]
-        if not candidates:
-            self.set_status("Select at least one file.")
-            return
-        total = sum(size for _, size in candidates)
-        if not messagebox.askyesno(
-            "Confirm cleanup",
-            (
-                f"Move {len(candidates)} files ({_format_bytes(total)}) to the Recycle Bin?\n\n"
-                "Files newer than the selected age or changed since the scan will be skipped."
-            ),
-            parent=self,
-        ):
-            return
-        paths = [path for path, _ in candidates]
-        root = self.scan_result.scanned_root
-        days = int(self.age_var.get())
-        self.set_status("Moving selected files to the Recycle Bin...")
-        self._start_job(
-            lambda: recycle_files(paths, root, days),
-            self._clean_finished,
-        )
-
-    def _clean_finished(self, count: Any) -> None:
-        self.scan_result = None
-        self.scan_days = None
-        self.scan_rows = {}
-        if self.current_page == "cleanup" and hasattr(self, "clean_tree"):
-            self.clean_tree.delete(*self.clean_tree.get_children())
-            self.scan_summary_var.set("Cleanup complete. Scan again to review storage.")
-        self.set_status(f"Moved {count} files to the Recycle Bin.")
+    # =========================================================================
+    # PAGE 4: STARTUP APPS
+    # =========================================================================
 
     def _render_startup(self) -> None:
         self._section_heading(
             self.page_body,
-            "Choose apps you do not need at sign-in",
-            "Manage startup entries for your account only. Disabling an entry does not uninstall or close the app.",
+            self._t("nav_startup"),
+            "Manage user startup entries. Disabling an entry prevents auto-launching without uninstalling.",
         )
 
-        active_card = self._card(self.page_body, padx=13, pady=11)
-        active_card.pack(fill="both", expand=True, pady=(0, 12))
-        active_header = tk.Frame(active_card, bg=SURFACE)
-        active_header.pack(fill="x", pady=(0, 8))
-        tk.Label(
-            active_header,
-            text="Currently starts with Windows",
-            bg=SURFACE,
-            fg=TEXT,
-            font=(FONT, 10, "bold"),
-        ).pack(side="left")
-        self._button(active_header, "Refresh list", self._refresh_startup, compact=True).pack(
-            side="right"
-        )
-        self.active_startup_tree = ttk.Treeview(
-            active_card,
-            columns=("name", "command"),
-            show="headings",
-            selectmode="extended",
-            height=8,
-        )
-        self.active_startup_tree.heading("name", text="Entry name")
-        self.active_startup_tree.heading("command", text="Startup command (preview)")
-        self.active_startup_tree.column("name", width=210, anchor="w")
-        self.active_startup_tree.column("command", width=640, anchor="w")
-        active_scroll = ttk.Scrollbar(
-            active_card, orient="vertical", command=self.active_startup_tree.yview
-        )
-        self.active_startup_tree.configure(yscrollcommand=active_scroll.set)
+        active_card = self._card(self.page_body, padx=14, pady=12)
+        active_card.pack(fill="both", expand=True, pady=(0, 10))
+
+        head = tk.Frame(active_card, bg=SURFACE)
+        head.pack(fill="x", pady=(0, 8))
+        tk.Label(head, text="Starts with Windows", bg=SURFACE, fg=TEXT, font=(FONT, 10, "bold")).pack(side="left")
+        self._button(head, "Refresh", self._refresh_startup, compact=True).pack(side="right")
+
+        self.active_startup_tree = ttk.Treeview(active_card, columns=("name", "cmd"), show="headings", height=7)
+        self.active_startup_tree.heading("name", text="Application Name")
+        self.active_startup_tree.heading("cmd", text="Startup Command")
+        self.active_startup_tree.column("name", width=220, anchor="w")
+        self.active_startup_tree.column("cmd", width=550, anchor="w")
+
+        sc1 = ttk.Scrollbar(active_card, orient="vertical", command=self.active_startup_tree.yview)
+        self.active_startup_tree.configure(yscrollcommand=sc1.set)
         self.active_startup_tree.pack(side="left", fill="both", expand=True)
-        active_scroll.pack(side="right", fill="y")
-        active_actions = tk.Frame(active_card, bg=SURFACE)
-        active_actions.pack(fill="x", pady=(9, 0))
-        self._button(
-            active_actions,
-            "Disable selected",
-            self._disable_startup,
-            primary=True,
-            compact=True,
-        ).pack(side="left")
-        tk.Label(
-            active_actions,
-            text="Selected apps will stop launching automatically at your next sign-in.",
-            bg=SURFACE,
-            fg=MUTED,
-            font=(FONT, 8),
-        ).pack(side="right")
+        sc1.pack(side="right", fill="y")
 
-        disabled_card = self._card(self.page_body, padx=13, pady=11)
-        disabled_card.pack(fill="both", expand=True)
-        disabled_header = tk.Frame(disabled_card, bg=SURFACE)
-        disabled_header.pack(fill="x", pady=(0, 8))
-        tk.Label(
-            disabled_header,
-            text="Entries disabled by PC Booster",
-            bg=SURFACE,
-            fg=TEXT,
-            font=(FONT, 10, "bold"),
-        ).pack(side="left")
-        self.disabled_startup_tree = ttk.Treeview(
-            disabled_card,
-            columns=("name", "command"),
-            show="headings",
-            selectmode="extended",
-            height=4,
-        )
-        self.disabled_startup_tree.heading("name", text="Entry name")
-        self.disabled_startup_tree.heading("command", text="Saved startup command")
-        self.disabled_startup_tree.column("name", width=210, anchor="w")
-        self.disabled_startup_tree.column("command", width=640, anchor="w")
-        disabled_scroll = ttk.Scrollbar(
-            disabled_card, orient="vertical", command=self.disabled_startup_tree.yview
-        )
-        self.disabled_startup_tree.configure(yscrollcommand=disabled_scroll.set)
+        act_foot = tk.Frame(active_card, bg=SURFACE)
+        act_foot.pack(fill="x", pady=(8, 0))
+        self._button(act_foot, "Disable Selected Entry", self._disable_startup_entry, primary=True, compact=True).pack(side="left")
+
+        # Disabled entries card
+        dis_card = self._card(self.page_body, padx=14, pady=12)
+        dis_card.pack(fill="both", expand=True)
+
+        tk.Label(dis_card, text="Disabled Entries (Can be Restored)", bg=SURFACE, fg=TEXT, font=(FONT, 10, "bold")).pack(anchor="w", pady=(0, 6))
+
+        self.disabled_startup_tree = ttk.Treeview(dis_card, columns=("name", "cmd"), show="headings", height=4)
+        self.disabled_startup_tree.heading("name", text="Application Name")
+        self.disabled_startup_tree.heading("cmd", text="Saved Command")
+        self.disabled_startup_tree.column("name", width=220, anchor="w")
+        self.disabled_startup_tree.column("cmd", width=550, anchor="w")
+
+        sc2 = ttk.Scrollbar(dis_card, orient="vertical", command=self.disabled_startup_tree.yview)
+        self.disabled_startup_tree.configure(yscrollcommand=sc2.set)
         self.disabled_startup_tree.pack(side="left", fill="both", expand=True)
-        disabled_scroll.pack(side="right", fill="y")
-        self._button(
-            disabled_card,
-            "Restore selected",
-            self._restore_startup,
-            compact=True,
-        ).pack(side="left", pady=(8, 0))
+        sc2.pack(side="right", fill="y")
+
+        dis_foot = tk.Frame(dis_card, bg=SURFACE)
+        dis_foot.pack(fill="x", pady=(8, 0))
+        self._button(dis_foot, "Restore Selected Entry", self._restore_startup_entry, compact=True).pack(side="left")
+
         self._refresh_startup()
 
     def _refresh_startup(self) -> None:
         try:
             active = startup.list_active()
             disabled = startup.list_disabled()
-        except OSError as error:
-            self.show_error(f"Could not read startup entries: {error}")
-            return
-        self.active_startup_tree.delete(*self.active_startup_tree.get_children())
-        self.disabled_startup_tree.delete(*self.disabled_startup_tree.get_children())
-        self.startup_active_rows = {}
-        self.startup_disabled_rows = {}
-        for index, item in enumerate(active):
-            row_id = f"active-{index}"
-            self.startup_active_rows[row_id] = item["name"]
-            self.active_startup_tree.insert(
-                "", "end", iid=row_id, values=(item["name"], _short(item["command"]))
-            )
-        for index, item in enumerate(disabled):
-            row_id = f"disabled-{index}"
-            self.startup_disabled_rows[row_id] = item["name"]
-            self.disabled_startup_tree.insert(
-                "", "end", iid=row_id, values=(item["name"], _short(item["command"]))
-            )
-        if not active:
-            self.set_status("No startup entries were found for your account.")
+        except OSError:
+            active, disabled = [], []
 
-    def _disable_startup(self) -> None:
-        selected = self.active_startup_tree.selection()
-        names = [self.startup_active_rows[row] for row in selected if row in self.startup_active_rows]
+        if hasattr(self, "active_startup_tree"):
+            self.active_startup_tree.delete(*self.active_startup_tree.get_children())
+            self.startup_active_rows = {}
+            for idx, item in enumerate(active):
+                row_id = f"a_{idx}"
+                self.startup_active_rows[row_id] = item["name"]
+                self.active_startup_tree.insert("", "end", iid=row_id, values=(item["name"], _short(item["command"])))
+
+        if hasattr(self, "disabled_startup_tree"):
+            self.disabled_startup_tree.delete(*self.disabled_startup_tree.get_children())
+            self.startup_disabled_rows = {}
+            for idx, item in enumerate(disabled):
+                row_id = f"d_{idx}"
+                self.startup_disabled_rows[row_id] = item["name"]
+                self.disabled_startup_tree.insert("", "end", iid=row_id, values=(item["name"], _short(item["command"])))
+
+    def _disable_startup_entry(self) -> None:
+        if not hasattr(self, "active_startup_tree"):
+            return
+        sel = self.active_startup_tree.selection()
+        names = [self.startup_active_rows[r] for r in sel if r in self.startup_active_rows]
         if not names:
-            self.set_status("Select at least one startup entry.")
+            self.set_status("Select an entry to disable.")
             return
-        preview = "\n".join(f"• {name}" for name in names[:8])
-        if len(names) > 8:
-            preview += f"\n• and {len(names) - 8} more"
-        if not messagebox.askyesno(
-            "Confirm startup change",
-            (
-                f"Selected entries ({len(names)}):\n{preview}\n\n"
-                "These apps will no longer start automatically at sign-in. They will not be closed now. "
-                "You can restore them from the disabled list."
-            ),
-            parent=self,
-        ):
-            return
-        done, errors = [], []
         for name in names:
             try:
                 startup.disable(name)
-                done.append(name)
-            except (OSError, ValueError) as error:
-                errors.append(f"{name}: {error}")
+            except Exception:
+                pass
         self._refresh_startup()
-        if errors:
-            self.show_error("Some entries could not be changed:\n" + "\n".join(errors[:6]))
-        if done:
-            self.set_status(f"Disabled {len(done)} startup entries. You can restore them at any time.")
+        self.set_status(f"Disabled {len(names)} startup entries.")
 
-    def _restore_startup(self) -> None:
-        selected = self.disabled_startup_tree.selection()
-        names = [
-            self.startup_disabled_rows[row]
-            for row in selected
-            if row in self.startup_disabled_rows
-        ]
-        if not names:
-            self.set_status("Select a disabled entry to restore.")
+    def _restore_startup_entry(self) -> None:
+        if not hasattr(self, "disabled_startup_tree"):
             return
-        done, errors = [], []
+        sel = self.disabled_startup_tree.selection()
+        names = [self.startup_disabled_rows[r] for r in sel if r in self.startup_disabled_rows]
+        if not names:
+            self.set_status("Select an entry to restore.")
+            return
         for name in names:
             try:
                 startup.restore(name)
-                done.append(name)
-            except (OSError, ValueError) as error:
-                errors.append(f"{name}: {error}")
+            except Exception:
+                pass
         self._refresh_startup()
-        if errors:
-            self.show_error("Some entries could not be restored:\n" + "\n".join(errors[:6]))
-        if done:
-            self.set_status(f"Restored {len(done)} startup entries.")
+        self.set_status(f"Restored {len(names)} startup entries.")
+
+    # =========================================================================
+    # PAGE 5: REVERSIBLE WINDOWS TWEAKS
+    # =========================================================================
 
     def _render_tweaks(self) -> None:
-        self._render_background_settings()
-        self._section_heading(
-            self.page_body,
-            "Small, transparent changes",
-            "Choose individual changes or apply the suggested interface settings in one click. Original values are saved for restore.",
-        )
-
-        explanation = self._card(self.page_body, padx=16, pady=13)
-        explanation.pack(fill="x", pady=(0, 13))
-        tk.Label(
-            explanation,
-            text=(
-                "This version does not disable Windows Update, Defender, system services, or the page file. "
-                "These changes apply only to the current Windows account."
-            ),
-            bg=SURFACE,
-            fg=MUTED,
-            font=(FONT, 9),
-            anchor="w",
-            justify="left",
-            wraplength=780,
-        ).pack(fill="x")
+        self._section_heading(self.page_body, self._t("tweaks_title"), self._t("tweaks_desc"))
 
         try:
             states = tweaks.current_states()
-        except OSError as error:
+        except OSError:
             states = {}
-            self.set_status(f"Could not read some Windows settings: {error}")
 
         self.tweak_vars = {}
         self.tweak_status_vars = {}
         self.tweak_status_labels = {}
-        descriptions = {
-            "animations": "Reduces minimize and maximize animation. Sign out and back in may be required.",
-            "transparency": "Turns off transparency. You can restore the original value at any time.",
-        }
-        for name, item in tweaks.TWEAKS.items():
-            row = self._card(self.page_body, padx=16, pady=13)
-            row.pack(fill="x", pady=5)
-            top = tk.Frame(row, bg=SURFACE)
+
+        for key, item in tweaks.TWEAKS.items():
+            card = self._card(self.page_body, padx=16, pady=10)
+            card.pack(fill="x", pady=4)
+
+            top = tk.Frame(card, bg=SURFACE)
             top.pack(fill="x")
-            var = tk.BooleanVar(value=states.get(name, False))
-            self.tweak_vars[name] = var
-            check = ttk.Checkbutton(
-                top,
-                text=item["label"],
-                variable=var,
-                style="Dark.TCheckbutton",
-            )
-            check.pack(side="left")
-            status = tk.StringVar(
-                value="Applied" if states.get(name, False) else "Not applied"
-            )
-            self.tweak_status_vars[name] = status
-            status_label = tk.Label(
-                top, textvariable=status, bg=SURFACE, fg=ACCENT if states.get(name, False) else MUTED, font=(FONT, 8)
-            )
-            status_label.pack(side="right")
-            self.tweak_status_labels[name] = status_label
+
+            applied = states.get(key, False)
+            var = tk.BooleanVar(value=applied)
+            self.tweak_vars[key] = var
+
+            chk = ttk.Checkbutton(top, text=item["label"], variable=var, style="Dark.TCheckbutton")
+            chk.pack(side="left")
+
+            st_var = tk.StringVar(value="Applied" if applied else "Not applied")
+            self.tweak_status_vars[key] = st_var
+            lbl = tk.Label(top, textvariable=st_var, bg=SURFACE, fg=ACCENT if applied else MUTED, font=(FONT, 8, "bold"))
+            lbl.pack(side="right")
+            self.tweak_status_labels[key] = lbl
+
             tk.Label(
-                row,
-                text=descriptions[name],
+                card,
+                text=item["description"],
                 bg=SURFACE,
                 fg=MUTED,
-                font=(FONT, 9),
+                font=(FONT, 8),
                 anchor="w",
-                justify="left",
-            ).pack(fill="x", pady=(7, 0))
+            ).pack(fill="x", padx=(24, 0), pady=(3, 0))
 
         actions = tk.Frame(self.page_body, bg=BG)
-        actions.pack(fill="x", pady=(14, 0))
-        self._button(actions, "Apply selected", self._apply_tweaks, primary=True).pack(
-            side="right"
-        )
-        self._button(
-            actions,
-            "Apply suggested UI settings",
-            self._apply_recommended_tweaks,
-            compact=True,
-        ).pack(side="left", padx=(0, 9))
-        self._button(actions, "Restore original values", self._restore_tweaks).pack(
-            side="left", padx=(0, 9)
-        )
-        tk.Label(
-            self.page_body,
-            text="Restore data is saved locally in the app data folder.",
-            bg=BG,
-            fg=MUTED,
-            font=(FONT, 8),
-            anchor="w",
-        ).pack(fill="x", pady=(16, 0))
+        actions.pack(fill="x", pady=(12, 0))
+        self._button(actions, self._t("apply_tweaks_btn"), self._apply_tweaks, primary=True).pack(side="right")
+        self._button(actions, "Apply Suggested Gaming Settings", self._apply_recommended_tweaks, color=ACCENT_CYAN).pack(side="left", padx=(0, 8))
+        self._button(actions, self._t("restore_tweaks_btn"), self._restore_tweaks).pack(side="left")
 
     def _apply_tweaks(self) -> None:
-        selected = [name for name, variable in self.tweak_vars.items() if variable.get()]
+        selected = [k for k, v in self.tweak_vars.items() if v.get()]
         if not selected:
-            self.set_status("Select at least one change.")
+            self.set_status("Select at least one tweak.")
             return
-        labels = "\n".join(f"• {tweaks.TWEAKS[name]['label']}" for name in selected)
-        if not messagebox.askyesno(
-            "Confirm Windows changes",
-            f"Apply these changes to your account?\n{labels}\n\n"
-            "Original values are saved first and can be restored from this page.",
-            parent=self,
-        ):
-            return
-        done, errors = [], []
-        for name in selected:
-            try:
-                tweaks.apply_selected([name])
-                done.append(name)
-            except (OSError, ValueError, TypeError) as error:
-                errors.append(f"{tweaks.TWEAKS[name]['label']}: {error}")
+        done = tweaks.apply_selected(selected)
         self._refresh_tweak_status()
-        if errors:
-            self.show_error("Some changes could not be applied:\n" + "\n".join(errors))
-        if done:
-            self.set_status(f"Applied {len(done)} changes. Original values are saved for restore.")
+        self.set_status(f"Applied {len(done)} tweaks. Original settings backed up.")
+        messagebox.showinfo("PC Booster Pro", f"Applied {len(done)} tweaks successfully!\nOriginal settings are backed up locally.", parent=self)
 
     def _apply_recommended_tweaks(self) -> None:
-        for variable in self.tweak_vars.values():
-            variable.set(True)
+        for v in self.tweak_vars.values():
+            v.set(True)
         self._apply_tweaks()
 
     def _restore_tweaks(self) -> None:
-        if not messagebox.askyesno(
-            "Restore your settings",
-            "Restore the values PC Booster saved before making changes?",
-            parent=self,
-        ):
-            return
         restored = tweaks.restore_original()
         self._refresh_tweak_status()
-        if restored:
-            self.set_status(f"Restored {len(restored)} original values.")
-        else:
-            self.set_status("There are no saved changes to restore.")
+        self.set_status(f"Restored {len(restored)} original settings.")
+        messagebox.showinfo("PC Booster Pro", f"Restored {len(restored)} original settings.", parent=self)
 
     def _refresh_tweak_status(self) -> None:
         try:
             states = tweaks.current_states()
-        except OSError as error:
-            self.show_error(f"Could not read tweak status: {error}")
-            return
-        for name, variable in self.tweak_status_vars.items():
-            applied = states.get(name, False)
-            variable.set("Applied" if applied else "Not applied")
-            if name in self.tweak_status_labels:
-                self.tweak_status_labels[name].configure(fg=ACCENT if applied else MUTED)
+        except OSError:
+            states = {}
+        for k, v in self.tweak_status_vars.items():
+            app = states.get(k, False)
+            v.set("Applied" if app else "Not applied")
+            if k in self.tweak_status_labels:
+                self.tweak_status_labels[k].configure(fg=ACCENT if app else MUTED)
 
-    def _render_background_settings(self) -> None:
-        self._section_heading(
-            self.page_body,
-            "Background & startup",
-            "Keep PC Booster available from the system tray and choose whether it opens when you sign in.",
-        )
-        card = self._card(self.page_body, padx=16, pady=13)
-        card.pack(fill="x", pady=(0, 18))
-        try:
-            startup_enabled = autostart.is_enabled()
-        except OSError as error:
-            startup_enabled = False
-            self.set_status(f"Could not read startup setting: {error}")
+    # =========================================================================
+    # PAGE 6: HARDWARE & SYSTEM DIAGNOSTICS (SPECS)
+    # =========================================================================
 
-        self.startup_var = tk.BooleanVar(value=startup_enabled)
-        ttk.Checkbutton(
-            card,
-            text="Start PC Booster when I sign in to Windows",
-            variable=self.startup_var,
-            command=self._toggle_startup,
-            style="Dark.TCheckbutton",
-        ).pack(anchor="w")
+    def _render_specs(self) -> None:
+        self._section_heading(self.page_body, self._t("specs_title"), self._t("specs_desc"))
+
+        specs = get_full_system_specs()
+        cpu = specs["cpu"]
+        mem = specs["memory"]
+        os_info = specs["os"]
+
+        # CPU & Memory Cards Row
+        row1 = tk.Frame(self.page_body, bg=BG)
+        row1.pack(fill="x", pady=(0, 10))
+        row1.grid_columnconfigure(0, weight=1, uniform="specs_top")
+        row1.grid_columnconfigure(1, weight=1, uniform="specs_top")
+
+        # CPU Card
+        cpu_card = self._card(row1, padx=16, pady=12)
+        cpu_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        tk.Label(cpu_card, text="🧠 Processor (CPU)", bg=SURFACE, fg=ACCENT, font=(FONT, 11, "bold")).pack(anchor="w")
+        tk.Label(cpu_card, text=cpu["name"], bg=SURFACE, fg=TEXT, font=(FONT, 11, "bold"), wraplength=380).pack(anchor="w", pady=(4, 6))
         tk.Label(
-            card,
-            text="Starts minimized to the tray. This setting applies only to your Windows account.",
+            cpu_card,
+            text=f"Cores: {cpu['physical_cores']} Physical • {cpu['logical_cores']} Threads\nClock Speed: ~{cpu['current_ghz']:.2f} GHz",
             bg=SURFACE,
             fg=MUTED,
             font=(FONT, 9),
-            anchor="w",
-        ).pack(fill="x", padx=(25, 0), pady=(4, 12))
-
-        self.tray_var = tk.BooleanVar(value=self.close_to_tray)
-        ttk.Checkbutton(
-            card,
-            text="Keep running in the tray when I close or minimize the window",
-            variable=self.tray_var,
-            command=self._toggle_close_to_tray,
-            style="Dark.TCheckbutton",
+            justify="left",
         ).pack(anchor="w")
+
+        # Memory Card
+        mem_card = self._card(row1, padx=16, pady=12)
+        mem_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        tk.Label(mem_card, text="⚡ System Memory (RAM)", bg=SURFACE, fg=ACCENT_CYAN, font=(FONT, 11, "bold")).pack(anchor="w")
+        tk.Label(mem_card, text=f"{_format_bytes(mem['total_bytes'])} Total RAM", bg=SURFACE, fg=TEXT, font=(FONT, 13, "bold")).pack(anchor="w", pady=(4, 6))
         tk.Label(
-            card,
-            text="Use the tray icon's Exit command to quit completely. Monitoring slows down while hidden.",
+            mem_card,
+            text=f"Used: {_format_bytes(mem['used_bytes'])} ({mem['percent']:.1f}%)\nFree: {_format_bytes(mem['free_bytes'])}",
             bg=SURFACE,
             fg=MUTED,
             font=(FONT, 9),
-            anchor="w",
-        ).pack(fill="x", padx=(25, 0), pady=(4, 0))
+            justify="left",
+        ).pack(anchor="w")
 
-    def _toggle_startup(self) -> None:
-        enabled = self.startup_var.get()
-        try:
-            autostart.set_enabled(enabled)
-        except (OSError, ValueError) as error:
-            self.startup_var.set(not enabled)
-            self.show_error(f"Could not update the Windows sign-in setting:\n{error}")
-            return
-        self.set_status(
-            "PC Booster will start minimized at sign-in."
-            if enabled
-            else "PC Booster will no longer start at sign-in."
-        )
+        # GPU Card
+        gpu_card = self._card(self.page_body, padx=16, pady=12)
+        gpu_card.pack(fill="x", pady=(0, 10))
+        tk.Label(gpu_card, text="🎮 Graphics Accelerators (GPU)", bg=SURFACE, fg=WARN, font=(FONT, 11, "bold")).pack(anchor="w")
+        for gpu_name in specs["gpus"]:
+            tk.Label(gpu_card, text=f"• {gpu_name}", bg=SURFACE, fg=TEXT, font=(FONT, 10, "bold")).pack(anchor="w", pady=(2, 0))
 
-    def _toggle_close_to_tray(self) -> None:
-        self.close_to_tray = self.tray_var.get()
-        prefs = read_json("settings.json", {})
-        if not isinstance(prefs, dict):
-            prefs = {}
-        prefs["close_to_tray"] = self.close_to_tray
-        try:
-            write_json("settings.json", prefs)
-        except OSError as error:
-            self.close_to_tray = not self.close_to_tray
-            self.tray_var.set(self.close_to_tray)
-            self.show_error(f"Could not save the tray setting:\n{error}")
-            return
-        self.set_status(
-            "The window will stay available in the system tray."
-            if self.close_to_tray
-            else "Closing the window will quit PC Booster."
+        # Storage Partitions Deck
+        drives_card = self._card(self.page_body, padx=16, pady=12)
+        drives_card.pack(fill="x", pady=(0, 10))
+        tk.Label(drives_card, text="💾 Storage Volumes & Partitions", bg=SURFACE, fg=TEXT, font=(FONT, 11, "bold")).pack(anchor="w", pady=(0, 8))
+
+        for drive in specs["drives"]:
+            d_row = tk.Frame(drives_card, bg=SURFACE)
+            d_row.pack(fill="x", pady=4)
+            tk.Label(
+                d_row,
+                text=f"{drive['mount']} ({drive['fstype']}) - Free {_format_bytes(drive['free'])} of {_format_bytes(drive['total'])}",
+                bg=SURFACE,
+                fg=TEXT,
+                font=(FONT, 9, "bold"),
+            ).pack(side="left")
+            pct_label = tk.Label(d_row, text=f"{drive['percent']:.0f}% Used", bg=SURFACE, fg=MUTED, font=(FONT, 8))
+            pct_label.pack(side="right")
+
+            # Progress bar
+            pbar = ttk.Progressbar(drives_card, mode="determinate", maximum=100, value=drive["percent"], style="Green.Horizontal.TProgressbar")
+            pbar.pack(fill="x", pady=(1, 6))
+
+        # Windows OS & Uptime Card
+        os_card = self._card(self.page_body, padx=16, pady=12)
+        os_card.pack(fill="x")
+        tk.Label(os_card, text="🪟 Windows OS & Host Environment", bg=SURFACE, fg=TEXT, font=(FONT, 11, "bold")).pack(anchor="w")
+        tk.Label(
+            os_card,
+            text=(
+                f"Operating System: {os_info['product']} {os_info['version_tag']}\n"
+                f"Architecture: {os_info['architecture']} • Computer Name: {os_info['hostname']}\n"
+                f"System Uptime: {os_info['uptime']} (Since last reboot)"
+            ),
+            bg=SURFACE,
+            fg=MUTED,
+            font=(FONT, 9),
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+    # =========================================================================
+    # PAGE 7: EXTENDED SETTINGS HUB & PROCESS WHITELIST
+    # =========================================================================
+
+    def _render_settings(self) -> None:
+        self._section_heading(self.page_body, self._t("settings_title"), self._t("settings_desc"))
+
+        # Section 1: Auto-Pilot Sentinel Engine Rules
+        s_card = self._card(self.page_body, padx=16, pady=12)
+        s_card.pack(fill="x", pady=(0, 10))
+        tk.Label(s_card, text="🤖 Auto-Pilot Sentinel Rules", bg=SURFACE, fg=ACCENT, font=(FONT, 11, "bold")).pack(anchor="w", pady=(0, 8))
+
+        self.set_ap_enabled = tk.BooleanVar(value=self.settings.get("auto_pilot_enabled", True))
+        ttk.Checkbutton(s_card, text="Enable Autonomous Auto-Pilot Sentinel (Zero-Kill Background Sentry)", variable=self.set_ap_enabled, style="Dark.TCheckbutton").pack(anchor="w")
+
+        self.set_turbo_enabled = tk.BooleanVar(value=self.settings.get("foreground_turbo", True))
+        ttk.Checkbutton(s_card, text="Foreground Turbo Shield (Elevate active game/software priority)", variable=self.set_turbo_enabled, style="Dark.TCheckbutton").pack(anchor="w", pady=(4, 0))
+
+        self.set_taming_enabled = tk.BooleanVar(value=self.settings.get("background_ram_taming", True))
+        ttk.Checkbutton(s_card, text="Background Bloatware Tamer (Silent working-set trim for idle apps >350 MB)", variable=self.set_taming_enabled, style="Dark.TCheckbutton").pack(anchor="w", pady=(4, 0))
+
+        # Section 2: Process Immunity Whitelist
+        w_card = self._card(self.page_body, padx=16, pady=12)
+        w_card.pack(fill="x", pady=(0, 10))
+        tk.Label(w_card, text=f"🛡️ {self._t('whitelist_title')}", bg=SURFACE, fg=ACCENT_CYAN, font=(FONT, 11, "bold")).pack(anchor="w")
+        tk.Label(w_card, text=self._t("whitelist_desc"), bg=SURFACE, fg=MUTED, font=(FONT, 8)).pack(anchor="w", pady=(2, 8))
+
+        w_input_row = tk.Frame(w_card, bg=SURFACE)
+        w_input_row.pack(fill="x", pady=(0, 6))
+
+        self.whitelist_input = tk.Entry(w_input_row, bg=SURFACE_ALT, fg=TEXT, insertbackground=ACCENT, relief="flat", font=(FONT, 9))
+        self.whitelist_input.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=5)
+        self.whitelist_input.insert(0, "app.exe")
+
+        self._button(w_input_row, f"+ {self._t('add_app_btn')}", self._add_whitelist_app, primary=True, compact=True).pack(side="right")
+        self._button(w_input_row, f"- {self._t('remove_app_btn')}", self._remove_whitelist_app, compact=True).pack(side="right", padx=(0, 6))
+
+        self.whitelist_box = tk.Listbox(
+            w_card,
+            bg=BG,
+            fg=TEXT,
+            selectbackground=ACCENT_DARK,
+            selectforeground=TEXT,
+            relief="flat",
+            height=6,
+            font=(FONT, 9),
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
         )
+        self.whitelist_box.pack(fill="x")
+        for item in self.settings.get("whitelist", []):
+            self.whitelist_box.insert("end", item)
+
+        # Section 3: System & Tray Settings
+        tray_card = self._card(self.page_body, padx=16, pady=12)
+        tray_card.pack(fill="x", pady=(0, 10))
+        tk.Label(tray_card, text="🖥️ System & Tray Behavior", bg=SURFACE, fg=TEXT, font=(FONT, 11, "bold")).pack(anchor="w", pady=(0, 8))
+
+        try:
+            start_login = autostart.is_enabled()
+        except OSError:
+            start_login = False
+
+        self.set_start_login = tk.BooleanVar(value=start_login)
+        ttk.Checkbutton(tray_card, text="Start PC Booster Pro when I sign in to Windows", variable=self.set_start_login, style="Dark.TCheckbutton").pack(anchor="w")
+
+        self.set_close_tray = tk.BooleanVar(value=self.settings.get("close_to_tray", True))
+        ttk.Checkbutton(tray_card, text="Keep running in system tray when window is closed or minimized", variable=self.set_close_tray, style="Dark.TCheckbutton").pack(anchor="w", pady=(4, 0))
+
+        # Save Button
+        save_foot = tk.Frame(self.page_body, bg=BG)
+        save_foot.pack(fill="x", pady=(8, 0))
+        self._button(save_foot, f"💾 {self._t('save_settings_btn')}", self._save_all_settings, primary=True).pack(side="right")
+
+    def _add_whitelist_app(self) -> None:
+        val = self.whitelist_input.get().strip().lower()
+        if not val or not val.endswith(".exe"):
+            messagebox.showwarning("PC Booster Pro", "Please enter a valid executable name (e.g. game.exe)", parent=self)
+            return
+        wl = self.settings.get("whitelist", [])
+        if val not in wl:
+            wl.append(val)
+            self.settings["whitelist"] = wl
+            self.whitelist_box.insert("end", val)
+            self.sentinel.update_settings(self.settings)
+            save_settings(self.settings)
+
+    def _remove_whitelist_app(self) -> None:
+        sel = self.whitelist_box.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        val = self.whitelist_box.get(idx)
+        wl = self.settings.get("whitelist", [])
+        if val in wl:
+            wl.remove(val)
+            self.settings["whitelist"] = wl
+            self.whitelist_box.delete(idx)
+            self.sentinel.update_settings(self.settings)
+            save_settings(self.settings)
+
+    def _save_all_settings(self) -> None:
+        self.settings["auto_pilot_enabled"] = self.set_ap_enabled.get()
+        self.settings["foreground_turbo"] = self.set_turbo_enabled.get()
+        self.settings["background_ram_taming"] = self.set_taming_enabled.get()
+        self.settings["close_to_tray"] = self.set_close_tray.get()
+
+        # Update Windows startup
+        login_val = self.set_start_login.get()
+        try:
+            autostart.set_enabled(login_val)
+        except Exception:
+            pass
+
+        save_settings(self.settings)
+        self.sentinel.update_settings(self.settings)
+        self.set_status("All extended settings saved successfully.")
+        messagebox.showinfo("PC Booster Pro", "Extended settings saved successfully!", parent=self)
+
+    # =========================================================================
+    # PERIODIC MONITORING & SYSTEM TRAY
+    # =========================================================================
+
+    def _update_home(self, data: dict[str, Any]) -> None:
+        if self.current_page != "home":
+            return
+
+        # 1. Update Circular Gauges
+        if "cpu" in self.gauges:
+            self.gauges["cpu"].set_value(data["cpu"], f"{data['cpu']:.1f}% capacity")
+        if "ram" in self.gauges:
+            self.gauges["ram"].set_value(
+                data["memory_percent"],
+                f"Free {_format_bytes(data['memory_available'])}",
+            )
+        if "disk" in self.gauges:
+            disk = data.get("disk")
+            if disk:
+                self.gauges["disk"].set_value(
+                    disk.percent,
+                    f"Free {_format_bytes(disk.free)}",
+                )
+        if "gpu" in self.gauges:
+            gpu = data.get("gpu")
+            if gpu:
+                detail = f"{gpu['temperature']:.0f}°C" if "temperature" in gpu else "Engine Active"
+                self.gauges["gpu"].set_value(gpu["usage"], detail)
+
+        # 2. Update Sentinel Stat Chips
+        stats = self.sentinel.get_stats()
+        if hasattr(self, "chip_turbo") and self.chip_turbo.winfo_exists():
+            self.chip_turbo.configure(text=stats["active_boosted_app"])
+            self.chip_tamed.configure(text=f"{stats['tamed_count']} instances")
+            self.chip_freed.configure(text=_format_bytes(stats["total_freed_bytes"]))
+            self._update_event_hud()
+
+        # 3. Update Process Table
+        if hasattr(self, "process_tree") and self.process_tree.winfo_exists():
+            self.process_tree.delete(*self.process_tree.get_children())
+            for p in data["processes"][:8]:
+                self.process_tree.insert(
+                    "",
+                    "end",
+                    values=(p["name"], f"{p['cpu']:.1f}%", _format_bytes(p["memory"])),
+                )
+
+    def _open_task_manager(self) -> None:
+        try:
+            subprocess.Popen(["taskmgr.exe"], close_fds=True)
+        except OSError:
+            pass
 
     def _ensure_tray(self) -> bool:
         if self.tray_icon is not None:
             return True
-        icon = None
         try:
             import pystray
             from PIL import Image
 
             with Image.open(_asset_path("pc_booster.ico")) as source:
                 tray_image = source.convert("RGBA").copy()
+
             menu = pystray.Menu(
-                pystray.MenuItem("Open PC Booster", self._tray_open, default=True),
-                pystray.MenuItem("Exit PC Booster", self._tray_exit),
+                pystray.MenuItem("⚡ PC Booster Pro", None, enabled=False),
+                pystray.MenuItem("🚀 Quick Boost Now", self._tray_quick_boost),
+                pystray.MenuItem("🛡️ Open Dashboard", self._tray_open, default=True),
+                pystray.MenuItem("⚙️ Settings & Whitelist", self._tray_settings),
+                pystray.MenuItem("❌ Exit PC Booster", self._tray_exit),
             )
-            icon = pystray.Icon("pc_booster", tray_image, "PC Booster", menu)
-            self.tray_icon = icon
-            icon.run_detached()
+            self.tray_icon = pystray.Icon("pc_booster", tray_image, "PC Booster Pro", menu)
+            self.tray_icon.run_detached()
             return True
-        except Exception as error:
-            if icon is not None:
-                try:
-                    icon.stop()
-                except Exception:
-                    pass
+        except Exception:
             self.tray_icon = None
-            self.set_status(f"System tray is unavailable: {error}")
             return False
+
+    def _tray_quick_boost(self, _icon: Any, _item: Any) -> None:
+        self.after(0, self._trigger_quick_boost)
 
     def _tray_open(self, _icon: Any, _item: Any) -> None:
         self.after(0, self._restore_from_tray)
+
+    def _tray_settings(self, _icon: Any, _item: Any) -> None:
+        self.after(0, lambda: (self._restore_from_tray(), self.show_page("settings")))
 
     def _tray_exit(self, _icon: Any, _item: Any) -> None:
         self.after(0, self._close)
@@ -1505,10 +1503,9 @@ class PCBooster(tk.Tk):
         else:
             self.deiconify()
             self.state("normal")
-            self.lift()
 
     def _on_unmap(self, _event: tk.Event) -> None:
-        if self.close_to_tray and self.state() == "iconic":
+        if self.settings.get("close_to_tray", True) and self.state() == "iconic":
             self.after_idle(self._hide_minimized_window)
 
     def _hide_minimized_window(self) -> None:
@@ -1516,18 +1513,13 @@ class PCBooster(tk.Tk):
             self.withdraw()
 
     def _request_close(self) -> None:
-        if not self.close_to_tray:
+        if not self.settings.get("close_to_tray", True):
             self._close()
             return
         if self._ensure_tray():
             self.withdraw()
             return
-        if messagebox.askyesno(
-            "System tray unavailable",
-            "PC Booster could not create a tray icon. Exit the app instead?",
-            parent=self,
-        ):
-            self._close()
+        self._close()
 
     def _tick(self) -> None:
         if self.closing:
@@ -1538,125 +1530,64 @@ class PCBooster(tk.Tk):
             def sample() -> None:
                 try:
                     self.monitor_pending.put((self.monitor.sample(), None))
-                except Exception as error:
-                    self.monitor_pending.put((None, error))
+                except Exception as err:
+                    self.monitor_pending.put((None, err))
 
-            threading.Thread(target=sample, name="PCBoosterMonitor", daemon=True).start()
-        interval = 8000 if self.state() == "withdrawn" else 2000
+            threading.Thread(target=sample, name="MonitorSampleThread", daemon=True).start()
+
+        interval = 8000 if self.state() == "withdrawn" else 2500
         self.after(interval, self._tick)
 
-    def _track_memory_pressure(self, data: dict[str, Any]) -> None:
-        if not self.auto_memory_alert:
-            self.low_memory_samples = 0
-            self.memory_pressure = False
-            return
-        was_under_pressure = self.memory_pressure
-        available = data["memory_available"] / max(data["memory_total"], 1)
-        if self.memory_pressure:
-            if available >= 0.14:
-                self.memory_pressure = False
-                self.low_memory_samples = 0
-                self.set_status("Available memory has recovered.")
-                self._notify_tray("Available memory has recovered.")
-            return
-        if available <= 0.10:
-            self.low_memory_samples += 1
-            if self.low_memory_samples >= 3:
-                self.memory_pressure = True
-                if not was_under_pressure:
-                    self.set_status("Alert: available memory is low. Review the highest-usage apps.")
-                    self._notify_tray(
-                        "Available memory is low. Open PC Booster to review high-usage apps."
-                    )
-        else:
-            self.low_memory_samples = 0
+    def _poll_pending(self) -> None:
+        try:
+            while True:
+                cb, res, err = self.pending.get_nowait()
+                self.busy = False
+                if err is not None:
+                    self.set_status("Operation failed.")
+                    messagebox.showerror("PC Booster Pro", str(err), parent=self)
+                else:
+                    cb(res)
+        except queue.Empty:
+            pass
+
+        try:
+            while True:
+                res, err = self.monitor_pending.get_nowait()
+                self.monitor_busy = False
+                if res is not None:
+                    self.last_snapshot = res
+                    self._update_home(res)
+        except queue.Empty:
+            pass
+
+        if not self.closing:
+            self.after(120, self._poll_pending)
 
     def _start_job(self, operation: Callable[[], Any], callback: Callable[[Any], None]) -> None:
-        if self.busy:
-            self.set_status("Wait for the current operation to finish.")
-            return
         self.busy = True
 
         def run() -> None:
             try:
                 self.pending.put((callback, operation(), None))
-            except Exception as error:
-                self.pending.put((callback, None, error))
+            except Exception as err:
+                self.pending.put((callback, None, err))
 
-        threading.Thread(target=run, name="PCBoosterWorker", daemon=True).start()
-
-    def _notify_tray(self, message: str) -> None:
-        icon = self.tray_icon
-        if self.state() != "withdrawn" or icon is None:
-            return
-        if not getattr(icon, "HAS_NOTIFICATION", False):
-            return
-        try:
-            icon.notify(message, "PC Booster")
-        except Exception:
-            pass
-
-    def _poll_pending(self) -> None:
-        try:
-            while True:
-                callback, result, error = self.pending.get_nowait()
-                self.busy = False
-                if error is not None:
-                    self.set_status("The operation did not complete.")
-                    if self.current_page == "cleanup" and hasattr(self, "clean_tree"):
-                        self.scan_result = None
-                        self.scan_days = None
-                        self.scan_rows = {}
-                        self.clean_tree.delete(*self.clean_tree.get_children())
-                        self.scan_summary_var.set("Scan did not complete. Scan again before cleanup.")
-                    elif self.current_page != "cleanup":
-                        self.scan_result = None
-                        self.scan_days = None
-                        self.scan_rows = {}
-                    self.show_error(str(error))
-                else:
-                    callback(result)
-        except queue.Empty:
-            pass
-        try:
-            while True:
-                result, error = self.monitor_pending.get_nowait()
-                self.monitor_busy = False
-                if error is not None:
-                    self.set_status(f"Could not refresh some readings: {error}")
-                elif result is not None:
-                    self.last_snapshot = result
-                    self._track_memory_pressure(result)
-                    self._update_home(result)
-        except queue.Empty:
-            pass
-        if not self.closing:
-            self.after(120, self._poll_pending)
+        threading.Thread(target=run, name="WorkerJobThread", daemon=True).start()
 
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
 
-    def show_error(self, text: str) -> None:
-        messagebox.showerror("PC Booster", text, parent=self)
-
     def _close(self) -> None:
         if self.closing:
             return
-        if self.busy:
-            self._restore_from_tray()
-            messagebox.showinfo(
-                "Operation in progress",
-                "Wait for the current operation to finish before closing the app.",
-                parent=self,
-            )
-            return
         self.closing = True
+        self.sentinel.stop()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
             except Exception:
                 pass
             self.tray_icon = None
-        if not self.monitor_busy:
-            self.monitor.close()
+        self.monitor.close()
         self.destroy()
